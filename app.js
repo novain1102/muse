@@ -44,7 +44,10 @@ const GENRES = {
                   seeds: ['liquid', 'rollers', 'minimal dnb', 'atmospheric', 'jungle', 'deep dnb', 'autonomic', 'halftime'] },
   'bass':       { label: 'Dubstep / Bass', zh: '低音', bpm: [138, 150],
                   seeds: ['deep dubstep', 'dub', 'halftime', '140', 'garage', 'wave', 'future garage', 'sub bass'] },
-  'hiphop':     { label: 'Hip-Hop / Trap', zh: '嘻哈 · Trap · 新派说唱', bpm: [70, 100], popTol: 0.6, recent: 2015, vocals: true,
+  'hiphop':     { label: 'Hip-Hop / Trap', zh: '嘻哈 · Trap · 新派说唱', bpm: [70, 100], popTol: 0.6, recent: 2015, minYear: 2010, vocals: true,
+                  // fullOnly: no 30 s previews when full tracks can be found; covers: other artists' versions / re-uploads of the
+                  // seeds' songs are welcome; alsoCn: also dig the Chinese catalogues (Kugou, QQ, NetEase with a proxy) and merge
+                  fullOnly: true, covers: true, alsoCn: true,
                   seeds: ['trap', 'melodic trap', 'rage', 'plugg', 'pluggnb', 'atlanta trap', 'dark trap', 'trap rap', 'melodic rap'],
                   scene: ['Travis Scott', 'Drake', 'Future', '21 Savage', 'Metro Boomin', 'Playboi Carti', 'Don Toliver', 'Lil Uzi Vert', 'Gunna', 'Young Thug', 'Kendrick Lamar'] },
   'lofi':       { label: 'Lo-Fi', zh: '低保真', bpm: [70, 92],
@@ -57,6 +60,7 @@ const GENRES = {
                   seeds: ['chinese hip hop', 'chinese trap', 'mandarin rap', 'chinese drill', 'c-rap', 'chinese underground rap', '华语说唱'],
                   // scene seed artists (scene.js ranks everything else by closeness to these: collabs, producers, albums, shared results);
                   // "A|B" = same artist, B is the name the CN catalogues use
+                  alsoCn: true,
                   scene: ['Asen', 'ThomBoyDontkill', 'Mac Ova Seas', 'Sasioverlxrd|SASI', '华一龙', 'APMozart'] },
 };
 /* ---------- curated crate: moods ---------- */
@@ -120,7 +124,7 @@ function tasteScore(t, ctx) {
   if (ctx.recent && t.year && t.year < ctx.recent) s -= 0.4 + 0.8 * Math.min(1, (ctx.recent - t.year) / 5);   // genres that want the current sound
   const uname = aname.toLowerCase();
   if (ctx.genrePhrases.some(gp => uname.includes(gp)) || /music|records? ?label|beats|official/i.test(uname) && /\d{3,}/.test(uname)) s -= 0.8;   // channel-style uploaders
-  if (SOFT_PENALTY.test(title) && !ctx.allowEdits) s -= 0.35;
+  if (SOFT_PENALTY.test(title) && !ctx.allowEdits && !ctx.covers) s -= 0.35;
   if (title.length > 14 && title === title.toUpperCase() && /[A-Z]/.test(title)) s -= 0.3;
   const em = (title.match(EMOJI) || []).length; if (em > 1) s -= 0.4 * em;
   if ((title.match(/#/g) || []).length > 1) s -= 0.6;
@@ -201,7 +205,8 @@ async function aiExpand(genres, moods, prompt) {
 }
 
 /* ---------- crate digging ---------- */
-const CN_PREFERRED = ['kugou', 'qqmusic'];   // Chinese sources tried for 华语 (after the picked one, if it is Chinese); Audius last
+const CN_PREFERRED = ['kugou', 'qqmusic', 'netease'];   // Chinese sources tried for 华语 (after the picked one, if it is Chinese); Audius last
+const CN_ALL = CN_PREFERRED;   // alsoCn genres: every Chinese catalogue that is set up (NetEase only with a proxy), merged
 function parsePrompt(text) {
   const g = new Set(), m = new Set(); let rest = text || '';
   for (const [re, kind, id] of PROMPT_MAP) if (re.test(rest)) { (kind === 'g' ? g : m).add(id); }
@@ -225,13 +230,28 @@ async function digCrates(args) {
   if (TP && !genres.length && !moods.length && !String(prompt || '').trim()) genres = T.genresFor(prov, TP);   // nothing picked: start from what you liked
   if (!genres.length) { const s = new Set(); moods.forEach(m => (MOOD_FALLBACK_GENRES[m] || []).slice(0, 2).forEach(g => s.add(g))); genres = s.size ? [...s] : ['deep-house']; }
   if (!moods.length && !genres.length) moods = ['groovy'];
+  // fullOnly genres: a preview-only pick (iTunes) is swapped for the default full-track source; alsoCn genres also dig the
+  // Chinese catalogues (Kugou, QQ, NetEase) in parallel. Results are interleaved (one version per song); previews only if nothing full turns up.
+  const fullOnly = genres.some(g => GENRES[g].fullOnly), alsoCn = genres.some(g => GENRES[g].alsoCn);
+  if ((fullOnly && !prov.capabilities.fullTrack || alsoCn) && !args._mix) {
+    const cnG = genres.some(g => GENRES[g].cn);   // Chinese genres: a Chinese catalogue leads (Audius stays the last resort below)
+    const main = fullOnly && !prov.capabilities.fullTrack ? Providers.resolve('audius') : cnG && !prov.keywords ? Providers.get('kugou') : prov;
+    const n = prov.capabilities.fullTrack ? need : Math.min(need, 14);   // need was sized for 30 s previews: full tracks need fewer
+    const cn = [cnG ? null : 'audius', ...(alsoCn ? CN_ALL : [])].filter((id, i, a) => id && id !== main.id && a.indexOf(id) === i && Providers.get(id) && (!Providers.get(id).available || Providers.get(id).available()));   // + Audius (full tracks) for non-Chinese genres
+    const runs = await Promise.all([main.id, ...cn].map((id, k) => digCrates({ ...args, genres, moods, need: k ? Math.ceil(n * 0.6) : n, source: id, _mix: true, _cn: true, _until: k ? Date.now() + 45000 : undefined, onStatus: k ? () => { } : onStatus })
+      .catch(e => { console.warn(`${Providers.get(id).name}: nothing for this set`, e); return null; })));
+    const lists = runs.map(r => r ? r.tracks : []), seen = new Set(), tracks = [];
+    for (let i = 0; tracks.length < n && lists.some(l => l.length > i); i++) for (const l of lists) { const t = l[i]; if (!t || tracks.length >= n) continue; const k = NEONDJ.scene.song(t); if (seen.has(k)) continue; seen.add(k); tracks.push(t); }
+    if (tracks.length >= Math.min(n, 4) || (tracks.length && !fullOnly)) return { tracks, info: { genres, moods }, source: main.id, liked: tracks.filter(t => t.fromLikes).length,
+      sources: Object.fromEntries([main.id, ...cn].map((id, k) => [id, tracks.filter(t => lists[k].includes(t)).length + '/' + lists[k].length])) };   // used / found per source
+  }
   // Chinese genres (华语) want a Chinese catalogue: try the picked source if it is one (e.g. QQ in mainland China), then
   // Kugou (plays worldwide); if both come back empty, carry on with the picked source (Audius: Chinese seed terms).
   if (genres.some(g => GENRES[g].cn) && !args._cn) {
-    const tries = [prov.keywords ? prov.id : null, ...CN_PREFERRED].filter((x, i, a) => x && Providers.get(x) && a.indexOf(x) === i);
+    const tries = [prov.keywords ? prov.id : null, ...CN_PREFERRED].filter((x, i, a) => x && Providers.get(x) && (!Providers.get(x).available || Providers.get(x).available()) && a.indexOf(x) === i);
     let best = null;
     for (const id of tries) {
-      try { const r = await digCrates({ ...args, genres, moods, source: id, _cn: true }); if (r.tracks.length >= Math.min(need, 4)) return r; if (r.tracks.length && (!best || r.tracks.length > best.tracks.length)) best = r; }
+      try { const r = await digCrates({ ...args, genres, moods, source: id, _cn: true, _mix: true }); if (r.tracks.length >= Math.min(need, 4)) return r; if (r.tracks.length && (!best || r.tracks.length > best.tracks.length)) best = r; }
       catch (e) { console.warn(`${Providers.get(id).name}: no Chinese tracks`, e); }
     }
     if (best) return best;   // a short Chinese set beats none; endless mode keeps digging
@@ -242,13 +262,13 @@ async function digCrates(args) {
   const moodWords = moods.flatMap(m => MOODS[m].words);
   const seedTerms = new Set([...genres.flatMap(g => GENRES[g].seeds), ...moodWords, ...P.words, ...aiWords].map(s => s.toLowerCase()));
   const bpmRanges = genres.map(g => GENRES[g].bpm); BPM_HOME = bpmRanges;
-  const ctx = { hits: genres.some(g => GENRES[g].hits && !GENRES[g].scene), popTol: Math.max(0, ...genres.map(g => GENRES[g].popTol || 0)), vocals: genres.some(g => GENRES[g].vocals), recent: Math.max(0, ...genres.map(g => GENRES[g].recent || 0)), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
+  const ctx = { hits: genres.some(g => GENRES[g].hits && !GENRES[g].scene), covers: genres.some(g => GENRES[g].covers), popTol: Math.max(0, ...genres.map(g => GENRES[g].popTol || 0)), vocals: genres.some(g => GENRES[g].vocals), recent: Math.max(0, ...genres.map(g => GENRES[g].recent || 0)), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
     genrePhrases: [...new Set([...srcGenres, 'lofi', 'lo-fi', 'deep house', 'techno', 'house music', 'hip hop', 'drum and bass'].map(x => x.toLowerCase()))].filter(x => x.length > 3) };
   const info = { genres, moods };
 
   const tx = TP ? { T, TP, TM, likes, taste } : null;
   if (prov.capabilities.crate !== 'scored') {
-    let tracks = await digSimple(prov, genres, moods, P.words.concat(aiWords), need, onStatus, tx, AV && { T, A: AV, w: avW });
+    let tracks = await digSimple(prov, genres, moods, P.words.concat(aiWords), need, onStatus, tx, AV && { T, A: AV, w: avW }, args._until || Infinity);
     if (TP) tracks = mixInLikes(tracks, likes, prov, TM, need, ctx);
     return { tracks, info, source: prov.id, liked: tracks.filter(t => t.fromLikes).length };
   }
@@ -279,7 +299,7 @@ async function digCrates(args) {
   const scoreAll = list => { const G = sceneSeeds.length ? SC.graph(list, sceneSeeds) : null;
     return (TP ? list.filter(t => !TP.ids.has(T.Likes.key(t))) : list).filter(t => !AV || !T.blocked(t, AV))
     .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); if (AV && avW && s > -50) s -= avW * T.penalty(t, AV);
-      const v = SC.variety(t); if (v) s -= 2 * v; if (G) s += 2 * SC.proximity(t, G); return { t, s }; }).filter(x => x.s > -50); };
+      const v = SC.variety(t); if (v) s -= 2 * v; if (G) s += 2 * Math.max(SC.proximity(t, G), ctx.covers ? SC.versionOf(t, G) : 0); return { t, s }; }).filter(x => x.s > -50); };
   let scored = scoreAll(cands);
   if (scored.length < need * 2) {          // widen: open searches without filters
     onStatus('Finding more tracks…');
@@ -331,7 +351,7 @@ function mixInLikes(tracks, likes, prov, TM, need, ctx) {
 }
 
 /* 'simple' crate for providers without popularity signals (e.g. preview catalogues): basic reject rules, shuffle, one per artist */
-async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, av = null) {
+async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, av = null, until = Infinity) {   // until: time budget (merged digs)
   const full = prov.capabilities.fullTrack;
   onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
@@ -340,9 +360,10 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
   const SC = NEONDJ.scene, sceneG = genres.filter(g => GENRES[g].scene), seedQ = new Set();
   const sceneSeeds = sceneG.flatMap(g => GENRES[g].scene.flatMap(x => x.split('|')));
   // scene genres: search the seed artists (catalogue name = last alias); everything else is ranked by scene.js
-  sceneG.forEach(g => shuffle(GENRES[g].scene).forEach(x => { const q = x.split('|').pop(); add(q, g); seedQ.add(q); }));
+  sceneG.forEach(g => shuffle(GENRES[g].scene).slice(0, GENRES[g].covers ? 7 : 99).forEach(x => { const q = x.split('|').pop(); add(q, g); seedQ.add(q); }));   // covers genres: a few seeds per dig (title searches follow)
   if (KW && KW.genres) {   // provider vocabulary (e.g. Chinese + English terms for CN platforms)
     for (const g of genres) {
+      if (GENRES[g].scene && GENRES[g].covers) { shuffle(KW.genres[g] || []).slice(0, 2).forEach(q => add(q, g)); continue; }   // scene + covers: a couple of genre terms too
       if (GENRES[g].scene) continue;
       const terms = shuffle(KW.genres[g] || [GENRES[g].label]), fl = KW.flavors && KW.flavors[g];
       if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
@@ -357,14 +378,15 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
   let res;
   if ((prov.capabilities.searchConcurrency || 3) === 1) {   // throttling source: one search at a time, stop once the crate is deep enough
     res = []; const enough = need * (genres.some(g => GENRES[g].hits) ? 6 : 4);
-    for (const q of qs) { try { res.push(...tag(q, await prov.search(q))); } catch (e) { } if (!seedQ.has(q) && res.filter(t => t.playable !== false).length >= enough) break; }
+    for (const q of qs) { if (Date.now() > until) break; try { res.push(...tag(q, await prov.search(q))); } catch (e) { } if (!seedQ.has(q) && res.filter(t => t.playable !== false).length >= enough) break; }
   } else res = (await pool(qs, 3, q => prov.search(q).then(list => tag(q, list)))).flat().filter(Boolean);
   let G = null;
   if (sceneG.length) {   // second hop: the seeds' strongest collaborators / producers get searched too
     G = SC.graph(res, sceneSeeds, res.filter(t => seedQ.has(t._q)));
-    const more = SC.expand(G, 6).filter(q => !gOf.has(q)); more.forEach(q => add(q, sceneG[0]));
+    const coverG = sceneG.find(g => GENRES[g].covers);   // covers genres: the seeds' songs by title -> free versions / re-uploads
+    const more = SC.expand(G, coverG ? 3 : 6).concat(coverG ? SC.songTitles(G, 7) : []).filter(q => !gOf.has(q)); more.forEach(q => add(q, sceneG[0]));
     const hop = async q => { try { return tag(q, await prov.search(q)); } catch (e) { return []; } };
-    if ((prov.capabilities.searchConcurrency || 3) === 1) { for (const q of more) res.push(...await hop(q)); } else res.push(...(await pool(more, 3, hop)).flat());
+    if ((prov.capabilities.searchConcurrency || 3) === 1) { for (const q of more) { if (Date.now() > until) break; res.push(...await hop(q)); } } else res.push(...(await pool(more, 3, hop)).flat());
     G = SC.graph(res, sceneSeeds, res.filter(t => seedQ.has(t._q)));
   }
   if (tx) res = res.concat(await digSimilar(prov, tx.likes, tx.TM, onStatus)).filter(t => !tx.TP.ids.has(tx.T.Likes.key(t)));
@@ -372,28 +394,32 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
   const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
   const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|[(（]\s*live\s*[)）]|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
+  const ALTERED = /\bdj\b|remix|\bedit\b|mashup|[(（][^)）]*版[)）]|律动|带感|\bbeats?\b|\[free\]|\bfree\b.*\btype\b|\btype\b|\bflip\b|\bfilp\b|\binst\b|vina|\bhouse\b|dj版|氛围版|伴奏|纯音乐|钢琴版|八音盒|铃声|片段|抖音|加速|降调|0\.\d+x|\b(slowed|sped|nightcore|instrumental)\b|串烧|中文版|填词|\(music from/i;   // covers genres: other singers welcome, altered edits not
   const fanUpload = t => /《.+》/.test(t.title);   // "《show》song" re-uploads
   const tooOld = t => !!(t._g && GENRES[t._g].minYear && t.year && t.year < GENRES[t._g].minYear);
-  const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && (!MAINSTREAM.test((t.artist || '') + ' ' + t.title) || (t._g && (GENRES[t._g].popTol || 0) >= 0.5)) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (tooOld(t)) return; if (t._g && GENRES[t._g].covers && (ALTERED.test(t.title + ' ' + (t.artist || '') + ' ' + (t.album || '')) || /\s[x×]\s/i.test(t.title))) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && (!MAINSTREAM.test((t.artist || '') + ' ' + t.title) || (t._g && (GENRES[t._g].popTol || 0) >= 0.5)) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
   if (G && !G.empty) {   // scene genres: the shared scorer (seed proximity − mainstream − variety show), only tracks near the scene
     const pop = SC.popularity(res);
     NEONDJ._lastScene = { G, pop, seen: res.length };   // for tests / debugging
     const tol = t => (t._g && GENRES[t._g].popTol) || 0, old = t => { const R = t._g && GENRES[t._g].recent; return R && t.year && t.year < R ? 0.4 + 0.8 * Math.min(1, (R - t.year) / 5) : 0; };
-    order = order.map(t => ({ t, x: SC.score(t, { G, pop, wPop: 1 - tol(t) }) })).map(o => (o.x.s -= old(o.t), o)).filter(o => !o.t._g || !GENRES[o.t._g].scene || o.x.prox >= 0.3)
+    order = order.map(t => ({ t, x: SC.score(t, { G, pop, wPop: 1 - tol(t), covers: !!(t._g && GENRES[t._g].covers) }) })).map(o => (o.x.s -= old(o.t), o)).filter(o => !o.t._g || !GENRES[o.t._g].scene || o.x.prox >= 0.3)
       .map(o => ({ t: o.t, s: o.x.s + rng() * 0.5 })).sort((a, b) => b.s - a.s).map(o => o.t);
   } else if (order.some(t => SC.variety(t))) order = order.map((t, k) => ({ t, s: -k * 0.01 - 3 * SC.variety(t) })).sort((a, b) => b.s - a.s).map(o => o.t);   // generic: variety-show cuts last
   if (tx) order = order.map((t, k) => ({ t, s: (G ? -k * 0.05 : 0) + tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile (scene genres: on top of the scene rank)
   if (av && av.w) order = order.map((t, k) => ({ t, s: -k * 0.05 - av.w * av.T.penalty(t, av.A) })).sort((a, b) => b.s - a.s).map(x => x.t);   // ✕ dislikes: similar artists / tags further down
-  const hitsWanted = genres.some(g => GENRES[g].hits);   // hit catalogues are partly paid: try more picks
+  const hitsWanted = genres.some(g => GENRES[g].hits || GENRES[g].covers);   // hit catalogues are partly paid: try more picks
+  const oneVersion = genres.some(g => GENRES[g].covers), songs = new Set();   // covers genres: one version per song
   if (lazy) {   // confirm each pick actually has a free stream before it enters the set
     const names = t => hitsWanted ? String(t.artist || '').toLowerCase().split(/\s*[、,&/]\s*|\s+feat\.?\s+/).filter(Boolean).concat(t.artistId) : [t.artistId];   // hit genres: features count for every artist on them
-    const picks = []; for (const t of order) { const ks = names(t); if (ks.some(k => (per.get(k) || 0) >= (hitsWanted ? 2 : 1))) continue; ks.forEach(k => per.set(k, (per.get(k) || 0) + 1)); picks.push(t); }   // hit genres: up to 2 per artist
+    const picks = []; for (const t of order) { const ks = names(t); if (ks.some(k => (per.get(k) || 0) >= (hitsWanted ? 2 : 1))) continue;  ks.forEach(k => per.set(k, (per.get(k) || 0) + 1)); picks.push(t); }   // hit genres: up to 2 per artist
+    (NEONDJ._dig = NEONDJ._dig || {})[prov.id] = { res: res.length, kept: m.size, order: order.length, picks: picks.length };   // tests / debugging
     let i = 0, tried = 0;
-    const worker = async () => { while (out.length < need && i < picks.length && tried < need * (hitsWanted ? 6 : 4)) { const t = picks[i++]; tried++;
-      try { await prov.resolveStream(t); if (t.url && t.playable !== false && out.length < need) out.push(finalizeTrack(t)); } catch (e) { } } };
+    const worker = async () => { while (out.length < need && i < picks.length && Date.now() < until + 15000 && tried < need * (hitsWanted ? 6 : 4)) { const t = picks[i++]; if (oneVersion && songs.has(SC.song(t))) continue; tried++;
+      try { await prov.resolveStream(t); if (t.url && t.playable !== false && out.length < need && !(oneVersion && songs.has(SC.song(t)))) { songs.add(SC.song(t)); out.push(finalizeTrack(t)); } } catch (e) { } } };
     await Promise.all(Array.from({ length: prov.capabilities.resolveConcurrency || 4 }, worker));
+    Object.assign(NEONDJ._dig[prov.id], { tried, out: out.length, i, need, late: Date.now() > until });
     if (!out.length && picks.length) throw new Error(prov.name + ': no free streams available here');
     return out;
   }
@@ -1783,7 +1809,7 @@ function init() {
     const v = $('#neteaseProxy').value.trim().replace(/\/+$/, '');
     if (v && !/^https:\/\/[^\s/]+/i.test(v) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(v)) { setStatus('Proxy URL must start with https://', 'err'); return; }
     Providers.settings.set('neteaseProxy', v); buildSources();
-    if (!v) { setStatus('NetEase proxy removed', ''); return; }
+    if (!v) { setStatus('Using the built-in NetEase proxy', ''); return; }
     setStatus('Checking proxy…', 'busy');
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }

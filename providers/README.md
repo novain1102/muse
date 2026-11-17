@@ -12,7 +12,7 @@ decks and mixer only ever see the normalized `Track` shape, so adding a source (
 | `cn-common.js` | Shared Chinese-platform helpers: genre/mood → search keywords (中文 + English), tag stripping, https upgrade. |
 | `kugou.js` | Kugou 酷狗 — keyless, JSONP search + play info straight from the page; free full songs (128 kbps); CDN has CORS. |
 | `qqmusic.js` | QQ Music QQ音乐 — keyless JSONP search + stream key; free songs, mainland China only (elsewhere no keys → falls back). |
-| `netease.js` | NetEase 网易云 — via your own CORS proxy (`proxy/worker.js`); hidden from Source until a proxy URL is saved. |
+| `netease.js` | NetEase 网易云 — via a CORS proxy (`proxy/worker.js`): built-in default on the hosted site, overridable under Advanced. |
 | `proxy/` | `worker.js` Cloudflare Worker (2 whitelisted read-only routes) + deploy steps. |
 | `_template.js` | Commented skeleton to copy. Not loaded. |
 
@@ -43,7 +43,7 @@ decks and mixer only ever see the normalized `Track` shape, so adding a source (
 |---|---|---|---|---|
 | Kugou 酷狗 | JSONP (`songsearch.kugou.com`) | JSONP (`m.kugou.com … cmd=playInfo`), free songs only | `sharefs.kugou.com`: `Access-Control-Allow-Origin: *`, Range | **works, no proxy** |
 | QQ Music | JSONP (`c.y.qq.com … client_search_cp`) | JSONP (`u.y.qq.com/cgi-bin/musicu.fcg` vkey); empty outside mainland China | `*.stream.qqmusic.qq.com`: ACAO `*` | **works in mainland China only**, else falls back |
-| NetEase 网易云 | no CORS headers, no JSONP | plain `api/song/enhance/player/url` (no weapi/eapi needed) | `m*.music.126.net` (https): ACAO `*` | **needs a proxy** (`proxy/`) |
+| NetEase 网易云 | no CORS headers, no JSONP | plain `api/song/enhance/player/url` (no weapi/eapi needed) | `m*.music.126.net` (https): ACAO `*` | **needs a proxy** (`proxy/`; built-in default) — JSON only, audio direct (ACAO `*`, Range 206) |
 | Kuwo 酷我 | no CORS (JS-variable "JSONP", not JSON) | `antiserver.kuwo.cn` no CORS | no ACAO → Web Audio would be silent | not implemented |
 | Migu 咪咕 | no ACAO for other origins | signed app headers | — | not implemented |
 

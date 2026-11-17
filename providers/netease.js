@@ -1,6 +1,7 @@
 /* Muse provider: NetEase Cloud Music 网易云音乐 — needs a small CORS proxy (see providers/proxy/).
  * music.163.com sends no CORS headers and has no JSONP, so a page on github.io cannot read its answers directly.
- * Hidden from the Source menu until a proxy URL is saved under Advanced → NetEase proxy.
+ * Uses the built-in proxy below on the hosted site; your own proxy URL (Advanced → NetEase proxy) overrides it.
+ * Only the two small JSON calls go through the proxy; audio comes straight from music.126.net (ACAO *, Range).
  *  - search:  <proxy>/netease/api/cloudsearch/pc       (plain JSON API, no weapi/eapi encryption needed)
  *  - stream:  <proxy>/netease/api/song/enhance/player/url?ids=[id]&br=128000  -> https://m*.music.126.net/… mp3
  *             (URLs expire after ~20 min; the audio CDN sends Access-Control-Allow-Origin: *, so the
@@ -13,10 +14,13 @@
   'use strict';
   const P = window.NEONDJ.providers, { fetchJSON } = P.net, CN = P.cn;
   const URL_TTL = 15 * 60 * 1000;
-  const base = () => P.settings.get('neteaseProxy').replace(/\/+$/, '');
+  // built-in proxy (Cloudflare Worker running proxy/worker.js; it only answers pages on novain1102.github.io and localhost:8000).
+  // A URL saved under Advanced → NetEase proxy overrides it; opened from file:// there is no default (the Worker would refuse).
+  const DEFAULT_PROXY = 'https://muse-proxy.308303735.workers.dev';
+  const base = () => (P.settings.get('neteaseProxy') || (/^https?:$/.test(location.protocol) ? DEFAULT_PROXY : '')).replace(/\/+$/, '');
 
   const NetEase = {
-    id: 'netease', name: 'NetEase Cloud Music', label: 'NetEase 网易云', hint: 'Free tracks via your proxy', fallback: 'audius',
+    id: 'netease', name: 'NetEase Cloud Music', label: 'NetEase 网易云', hint: 'Free full tracks · via a small proxy', fallback: 'audius',
     capabilities: { fullTrack: true, hasBpmKey: false, rangeRequests: true, filters: false, trending: false, crate: 'simple' },
     keywords: CN.KEYWORDS,
     available() { return /^https:\/\//.test(base()) || /^http:\/\/(localhost|127\.)/.test(base()); },
@@ -39,7 +43,7 @@
       const art = al.picUrl ? CN.https(al.picUrl) : '';
       return P.normalize({ src: 'netease', id: 'ne' + s.id, nid: s.id, title: s.name || 'Untitled', artist: ar.map(a => a.name).join(', ') || 'Unknown', artistId: (ar[0] && ar[0].id) || s.id,
         art: art ? art + '?param=400y400' : '', artSmall: art ? art + '?param=150y150' : '', dur: (s.dt || 0) / 1000, preview: false, bpm: null, key: null,
-        genre: '', mood: '', tags: term || '', url: '', link: 'https://music.163.com/#/song?id=' + s.id, plays: 0, prior: CN.prior(term),
+        genre: '', mood: '', tags: term || '', url: '', link: 'https://music.163.com/#/song?id=' + s.id, plays: (s.pop || 0) * 1000, prior: CN.prior(term), album: al.name || '', year: s.publishTime ? new Date(s.publishTime).getFullYear() : null,
         playable: s.fee !== 1 && s.fee !== 4 && (pv.st == null || pv.st >= 0) && (pv.pl == null || pv.pl > 0), signals: { tags: term || '' } });
     },
   };

@@ -1,6 +1,7 @@
 /* Muse — shared "scene" scorer: one generic ranking used by every provider / genre (no artist black- or white-lists).
  *   score(track) = proximity to the genre's seed artists   (co-occurrence: features / collabs, same album, same results)
  *                − mainstream penalty                       (play counts relative to the dug pool, per track and per artist)
+ *                (genres with covers: other artists' versions of the seeds' songs count as close, 0.6)
  *                − variety-show / talent-show penalty       (title / album patterns: (Live), 现场, 综艺, Ep.3, 第3期, 《…说唱…》 …)
  * Likes / dislikes (taste.js) are added on top by app.js. Loaded after taste.js, before app.js; exposes window.NEONDJ.scene.
  */
@@ -44,8 +45,17 @@
     for (const t of tracks) if (t.album && albumsOfSeeds.has(norm(t.album))) artistsOf(t).forEach(a => w.set(a, Math.max(w.get(a) || 0, 0.4)));
     if (seedHits) seedHits.forEach(t => artistsOf(t).forEach(a => { if (!w.has(a) || w.get(a) < 0.3) w.set(a, Math.min(0.3, (w.get(a) || 0) + 0.1)); }));
     const names = new Map(); tracks.forEach(t => splitRaw(t).forEach(r => { const k = norm(r); if (!names.has(k)) names.set(k, r); }));
-    return { w, S, names };
+    // the seeds' own songs (by base title), for genres that accept other versions of them (covers / re-uploads)
+    const songs = new Map(); tracks.forEach(t => { if (!isSeed(artistsOf(t)[0] || '')) return; /* the seed's own songs (first-billed), not guest spots */ const k = song(t), pl = (t.signals && t.signals.plays) || t.plays || 0; if (k.length >= 4 && (!songs.has(k) || songs.get(k).p < pl)) songs.set(k, { title: baseTitle(t.title), p: pl }); });
+    return { w, S, names, songs };
   }
+  /* a song's base title: no "(feat. …)", "(Explicit)", "[…]", " - …" suffixes */
+  const baseTitle = x => String(x || '').replace(/\s*[(（\[【][^)）\]】]*[)）\]】]/g, '').replace(/\s+(feat\.?|ft\.?|prod\.?)\s.*$/i, '').replace(/\s+-\s+.*$/, '').trim();
+  const song = t => norm(baseTitle(t.title));
+  /* another artist's version (cover / re-upload) of one of the seeds' songs */
+  const versionOf = (t, G) => !G || G.empty || !G.songs || !G.songs.has(song(t)) || artistsOf(t).some(a => G.w.get(a) >= 1) ? 0 : 0.6;
+  /* the seeds' song titles worth searching for free versions */
+  const songTitles = (G, k) => G && G.songs ? [...G.songs.values()].sort((a, b) => b.p - a.p).slice(0, k).map(x => x.title) : [];
   const proximity = (t, G) => { if (!G || G.empty) return 0; let p = 0; artistsOf(t).concat(featOf(t)).forEach(a => { p = Math.max(p, G.w.get(a) || 0); }); return p; };
   /* collaborators worth a second-hop search (not seeds, strongest links first) */
   const expand = (G, k) => G && !G.empty ? [...G.w.entries()].filter(x => x[1] < 1 && x[1] >= 0.5).sort((a, b) => b[1] - a[1]).slice(0, k).map(x => G.names.get(x[0]) || x[0]) : [];
@@ -64,10 +74,10 @@
 
   /* the one scorer: weights can be tuned per call; returns { s, parts } */
   function score(t, ctx) {
-    const prox = proximity(t, ctx.G), pop = ctx.pop ? ctx.pop(t) : 0, vs = variety(t);
+    const prox = Math.max(proximity(t, ctx.G), ctx.covers ? versionOf(t, ctx.G) : 0), pop = ctx.pop ? ctx.pop(t) : 0, vs = variety(t);
     const s = (ctx.wProx ?? 2) * prox - (ctx.wPop ?? 1) * pop - (ctx.wVar ?? 2) * vs;
     return { s, prox, pop, vs };
   }
 
-  NS.scene = { artistsOf, variety, graph, proximity, expand, popularity, score, VARIETY, norm };
+  NS.scene = { artistsOf, variety, graph, proximity, expand, popularity, score, VARIETY, norm, song, versionOf, songTitles };
 })();

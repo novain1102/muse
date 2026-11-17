@@ -19,7 +19,7 @@ Pick one in **Source**. Sources are pluggable (`providers/`, see `../providers/R
 | **iTunes previews** | 30 s previews (Audius's fallback) | nothing |
 | **Kugou 酷狗** | Full songs Kugou streams for free (standard quality); VIP-only songs skipped | nothing — called straight from the page |
 | **QQ Music QQ音乐** | Free songs only, **in mainland China only** (QQ hands out no stream keys elsewhere) | nothing; outside China it falls back to Audius |
-| **NetEase 网易云** | Free full songs; VIP/paid, region-blocked and 30 s trial clips skipped | your own small proxy (Cloudflare Worker, `providers/proxy/`) — hidden from Source until saved under Advanced |
+| **NetEase 网易云** | Free full songs; VIP/paid, region-blocked and 30 s trial clips skipped | a small proxy (Cloudflare Worker, `providers/proxy/`): a built-in one on the hosted site (`muse-proxy…workers.dev`, only answers novain1102.github.io and localhost:8000); your own URL under Advanced overrides it |
 
 Chinese platforms have no BPM/key data, so Muse measures tempo and energy itself (like the iTunes path).
 If a source finds nothing playable, the set comes from Audius instead. No logins, no VIP/region workarounds.
@@ -76,12 +76,21 @@ Modern trap / rap rather than boom-bap. Same generic knobs any genre can use (in
   scaled by 1 − popTol, so popular tracks are allowed here;
 - `recent: 2015` — older releases (where the source gives a date) lose 0.4–1.2 points;
 - `vocals: true` — beat / instrumental / "type" uploads lose points, songs with `prod.` / `feat.` gain a little.
-Sources: Audius (default) gives full tracks, but it's independent / underground artists — modern trap, rage, plugg, melodic
-rap, mostly 2020+; major-label artists aren't on it. The seed artists themselves come from iTunes (pick it as the source:
-30-second previews). Kugou / QQ search the seeds too, but most of those songs are paid there.
+- `minYear: 2010` — anything dated earlier is dropped;
+- `fullOnly: true` — no 30-second previews when full tracks can be found: picking iTunes swaps in Audius for this genre
+  (previews only if no full source answers);
+- `covers: true` — other artists' versions / re-uploads of the seeds' songs are welcome: `scene.js` learns the seeds' own
+  song titles from the dig, searches them, and counts a free version of one as close to the scene (0.6). Altered edits
+  are still skipped (DJ / remix / instrumental / sped-up / slowed / "type beat" / mashups / 伴奏 / 氛围版 …), and one version per song;
+- `alsoCn: true` — besides the picked source (Audius by default), Kugou, QQ Music and NetEase are dug in parallel and the
+  results interleaved (one version per song). Each extra source gets a ~45 s budget; a source that finds nothing is skipped.
+What actually plays free (tested Nov 2026 from outside mainland China): Audius — full tracks by independent artists
+(modern trap / rage / plugg, 2020+); Kugou and NetEase — the seeds' own songs are almost all paid, but covers / re-uploads
+of them and some features play in full; QQ Music — streams only for listeners in mainland China (elsewhere it finds
+nothing and drops out); iTunes — the real seed songs, 30 s previews only (used only if nothing full is found).
 
 ## 华语 / C-Pop
-Underground / new-wave Chinese rap and trap. The genre's config is only a handful of **scene seed artists**
+Underground / new-wave Chinese rap and trap (dug from Kugou, QQ Music and NetEase together, `alsoCn`). The genre's config is only a handful of **scene seed artists**
 (`GENRES.cpop.scene`: Asen, ThomBoyDontkill, Mac Ova Seas, Sasioverlxrd (SASI on Kugou), 华一龙, APMozart) — no keyword
 lists, no artist black- or white-lists. Muse searches the seeds, then their strongest collaborators / producers (second hop),
 and ranks everything with the shared scene scorer (`scene.js`, used by every provider and genre):
@@ -150,8 +159,8 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
 ## Advanced
 - **Keyword expansion** (optional): turns your vibe into a few extra search keywords with your own OpenAI API key
   (one short request per set, cached; the key stays in this browser). Off by default.
-- **NetEase proxy**: paste your Worker URL (see `providers/proxy/README.md`) and Save — Muse checks it and adds
-  NetEase to Source. Clear + Save removes it. Stored in `localStorage['neondj.provsettings']`.
+- **NetEase proxy**: the hosted site uses a built-in proxy; paste your own Worker URL (see `providers/proxy/README.md`) and
+  Save to override it — Muse checks it. Clear + Save goes back to the built-in one (opened from file:// there is none). Stored in `localStorage['neondj.provsettings']`.
 
 ## Storage
 Settings and likes keep their original keys (`neondj.opts`, `neondj.sel`, `neondj.likes`, …) so nothing is

@@ -1,4 +1,7 @@
-# NetEase proxy (optional)
+# NetEase proxy
+
+The hosted site already uses a built-in one (`https://muse-proxy.308303735.workers.dev`, allowed origins: novain1102.github.io,
+localhost:8000). Deploy your own only if you host Muse elsewhere or want your own quota; paste it under Advanced to override.
 
 NetEase Cloud Music's web API sends no CORS headers, so a static page can't read it directly.
 `worker.js` is a ~60-line Cloudflare Worker that forwards two read-only JSON calls (search, song URL)
