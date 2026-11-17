@@ -31,8 +31,11 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    tracks, playlist spam; penalises viral/chart-level play counts, pop re-rubs, genre-named SEO titles,
    channel-style uploaders; rewards mid-range "deeper cut" play counts, high like/repost ratio,
    matching tags, label-style titles. Max one track per artist.
-3. **Listening** – fetches ~20 s from the start (tempo + beat phase via onset autocorrelation) and a slice
-   from the body (loudness/energy) of each track. Audius also supplies BPM + key for most tracks.
+3. **Listening** – full tracks (up to 8 min) are decoded whole once: tempo + beat phase from the first ~25 s (onset
+   autocorrelation), loudness from the body, and a 0.1 s energy profile of the whole song (level, <150 Hz low end, onset
+   flux). Per bar on the beat grid that gives a robust score against the song's own median; 4-bar phrases in the loudest
+   third, the phrase re-entering after a break, and single bars far above the rest are marked **high-energy** (hooks,
+   drops). Longer tracks / previews fall back to a head + body slice. Audius also supplies BPM + key for most tracks.
 4. **Sequencing** – energy arc (warm-up → build → peak → cool-down) or build-up, while minimising tempo
    jumps, clashing keys (Camelot wheel) and same-artist adjacency. Tempo outliers become spares.
 5. **Mixing** – two decks, loudness-matched, tempo-synced (±8 %, half/double aware), transitions land on
@@ -40,6 +43,17 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    flange out, reverb wash, echo out, loop-roll drop with riser + impact, stutter cut, tape stop.
    Between transitions it occasionally adds phrase-end flourishes (loop roll, echo throw, filter dip,
    stutter, riser→drop). Intensity: Subtle / Normal / Wild.
+   **Mix-out point**: the best 4-bar phrase boundary whose overlap window holds no high-energy bar — preferring the boundary
+   right after a hook / drop ends, then a calmer stretch, then earlier; past the window it holds to the next clean boundary,
+   and a song that ends on its hook plays it out. Without an energy map, the live section detector holds a mix that would land
+   in a drop (up to 2 phrases).
+   **Hip-Hop / Trap and 华语 (rhythm-dense, vocal-led)**: each track plays most of the song (≥ 65 % and ≥ 2:30, about
+   80 % in tests; short tracks play out). Blends are short: when both grids are trustworthy (metadata agrees or onset
+   confidence ≥ 1.3) and tempos are within ±10 %, a 1-bar **bass swap** — the next track (cued one bar early) runs with its
+   lows cut, kick / 808 hand over on the 1 of its phrase, the old track is gone 2 beats later (≈ 3–6 s overlap, one low end
+   at a time), with a start-latency correction + jog nudges. Otherwise an **echo out**: the old bar filters up and throws an
+   echo, the new track starts clean on its own downbeat (no rhythmic overlap). No long mashups in these sets. House /
+   techno keep the long blends and Hype mashups.
 
 ## ♥ Likes & taste (红心 → 按你的品味挖歌)
 - Tap **♡** on the now-playing card (or press **L**) or on any row in the tracklist to like a track; tap again to un-like.
