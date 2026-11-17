@@ -113,16 +113,26 @@ closest to it in tempo/key, tagged BRIDGE in the list), followed by the new styl
 keeps digging the latest selection.
 
 ## Hype (Smooth / Club / Wild)
-The select next to the toggles (was "Auto FX intensity"; old settings map Subtle → Smooth, Normal → Club). Smooth keeps the
-gentle one-per-32-beats flourishes and EQ rides. Club / Wild run a performance scheduler on the live deck, decided ~1 beat
-before every bar and landed on the grid:
-- last bar of a 16-beat phrase: loop roll ½ → ¼ → ⅛, stutter, echo throw on the last beat, bass kill released on the 1,
-  tape stop that restarts exactly on the next 1 (rare in Club);
-- 8-beat moves: trance gate (⅛ chops), flanger / phaser swells (Wild layers these under other moves), offbeat bass chops;
-- builds: HPF riser + white-noise sweep + snare-roll style gate ramp (½ → ¼ → ⅛) into the phrase, impact on the drop.
-Sections come from the deck's pre-FX level (fast vs slow average and per-bar history: breakdown / build / drop / groove);
-moves are ×1.6 likelier in drops, ×1.3 in builds, ×0.35 in breakdowns, and builds are favoured 8 beats before a phrase
-that follows a breakdown. Measured: Club ≈ 5.5 moves per mid-track minute, Wild ≈ 14. Transitions: when the next track is
+The select next to the toggles (was "Auto FX intensity"; old settings map Subtle → Smooth, Normal → Club). The default is to
+do **nothing** — no quota of moves per minute. A move happens only when the music gives a reason, decided ~1 beat before a
+bar and landed on the phrase grid (when inside a phrase varies with the reason, plus randomness):
+- **a drop is coming** (build, or a breakdown that has run 4+ bars): a high-pass build-up over the last 2–4 bars (Club sets add
+  a riser), then the bass pulled on the last beat and slammed back in on the 1. Only here, and rarely, a cut — a short loop
+  roll, a ⅛ stutter or a tape stop: at most one per ~3 min in Club (~75 s in Wild), only in club / hip-hop sets, never in
+  chill or vocal-led (华语) sets;
+- **into a breakdown**: a reverb swell or a slow low-pass sweep down;
+- **a long plateau** (4+ untouched phrases in Club, 2+ in Wild): one slow HP or LP sweep over 8 or 16 bars, or a bass swap
+  that comes back on the 1; Wild may use a ⅛ trance gate here;
+- **a 32-beat phrase change** after a quiet stretch: an echo throw on the last beat;
+- flanger / phaser only under build-ups (Wild).
+Moves follow the style of the set: club (house / techno / bass …), trap (hip-hop), song (vocal-led), chill. After each move
+the track is left alone (Club ≥ 2 phrases, Wild ≥ 1). Smooth uses only filter dips into drops, reverb into breakdowns and
+echo throws after long quiet stretches — no cuts; the subtle EQ "rides" only come after 3+ untouched phrases.
+Transition scripts follow the same idea: loop-roll / tape-stop mixes only into a clear energy lift, in club / hip-hop sets,
+within the same cut cooldown. Measured on the box (4–6 min runs, moves per mid-track minute, before → after): Club tech-house 6.4 → 1.4 (of which
+1.0 subtle EQ rides), Wild tech-house 14.7 → 1.4–1.7, Club hip-hop 3.4 → 0.2; glitch cuts (roll / stutter / gate / chop)
+mid-track 3.2 / 7.5 / 2.8 → 0 per minute — they now come only right before a detected drop, behind a long cooldown.
+Transitions: when the next track is
 tempo-synced, Club plans a long mashup about 45 % of the time (Wild 65 %) and starts the mix early enough for it —
 *drums under* (next track's kick / bass under this one's mids / highs, then hand-over), *loop under* (the next track's first
 bar looped for 3 bars under this one, bass swap on the phrase), and with compatible keys *double drop* or *vocal over beat*.
@@ -135,8 +145,8 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
   channel volume (crossfader gain), pitch/tempo offset and BPM, plus FX lamps (LOOP, STUT, ECHO, FILT,
   FLNG, PHSR, VERB, STOP) that light while that effect is actually running. A knob glows lime with a dot
   while automation is moving it away from your setting.
-- With Auto FX on, Muse rides the mix like a DJ between transitions — at most one tasteful move per
-  16-beat phrase, timed to the beat grid and finished before the phrase ends: high-shelf or low cuts, a mid
+- With Auto FX on, Muse occasionally rides the mix like a DJ between transitions — only after 3+ untouched
+  phrases, one move, timed to the beat grid and finished before the phrase ends: high-shelf or low cuts, a mid
   lift, low-pass "breaths", high-pass sweeps into a phrase end, small gain rides, echo taps, reverb tails.
   Transitions add bass swaps, filter sweeps, echo-outs, loop rolls, tape stops, risers and impacts.
 - Every effect shows a chip in the visualizer with its deck and a progress bar; the matching pad lights up and
