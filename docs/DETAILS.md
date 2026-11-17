@@ -91,6 +91,23 @@ one, then queues **bridge** tracks (one from the old crate leaning toward the ne
 closest to it in tempo/key, tagged BRIDGE in the list), followed by the new style as a build-up. Endless mode
 keeps digging the latest selection.
 
+## Hype (Smooth / Club / Wild)
+The select next to the toggles (was "Auto FX intensity"; old settings map Subtle → Smooth, Normal → Club). Smooth keeps the
+gentle one-per-32-beats flourishes and EQ rides. Club / Wild run a performance scheduler on the live deck, decided ~1 beat
+before every bar and landed on the grid:
+- last bar of a 16-beat phrase: loop roll ½ → ¼ → ⅛, stutter, echo throw on the last beat, bass kill released on the 1,
+  tape stop that restarts exactly on the next 1 (rare in Club);
+- 8-beat moves: trance gate (⅛ chops), flanger / phaser swells (Wild layers these under other moves), offbeat bass chops;
+- builds: HPF riser + white-noise sweep + snare-roll style gate ramp (½ → ¼ → ⅛) into the phrase, impact on the drop.
+Sections come from the deck's pre-FX level (fast vs slow average and per-bar history: breakdown / build / drop / groove);
+moves are ×1.6 likelier in drops, ×1.3 in builds, ×0.35 in breakdowns, and builds are favoured 8 beats before a phrase
+that follows a breakdown. Measured: Club ≈ 5.5 moves per mid-track minute, Wild ≈ 14. Transitions: when the next track is
+tempo-synced, Club plans a long mashup about 45 % of the time (Wild 65 %) and starts the mix early enough for it —
+*drums under* (next track's kick / bass under this one's mids / highs, then hand-over), *loop under* (the next track's first
+bar looped for 3 bars under this one, bass swap on the phrase), and with compatible keys *double drop* or *vocal over beat*.
+Everything is AudioParam automation, so knobs, pads and the FX lamps show it; the master has a glue compressor + limiter
+(peaks stayed ≤ 0.89 in tests, no clipping).
+
 ## Live decks (what you see)
 - Every deck control is drawn from the real audio-node values each frame: 3-band EQ, filter (LP/HP with
   frequency), echo, reverb and gain knobs (arc + pointer + value), a level meter with peak hold, the

@@ -626,6 +626,7 @@ class Deck {
     this.rSend = g(0);
     this.vu = ctx.createAnalyser(); this.vu.fftSize = 256; this.vuBuf = new Float32Array(256);
 
+    this.secAn = ctx.createAnalyser(); this.secAn.fftSize = 1024; this.secBuf = new Float32Array(1024); this.trim.connect(this.secAn);   // pre-FX level for section detection
     this.srcNode.connect(this.trim).connect(this.low).connect(this.mid).connect(this.high).connect(this.hp).connect(this.lp);
     this.lp.connect(this.loopDry).connect(this.loopSum);
     this.lp.connect(this.loopIn).connect(this.loopDelay).connect(this.loopWet).connect(this.loopSum); this.loopDelay.connect(this.loopFb).connect(this.loopDelay);
@@ -648,7 +649,7 @@ class Deck {
   }
   load(track, startAt = 0, resolved = false) {
     if (!resolved && Providers.needsResolve(track)) return Providers.prepare(track).then(() => this.load(track, startAt, true));   // signed / expiring URLs
-    this.track = track; this.ready = false; this.startAt = startAt;
+    this.track = track; this.ready = false; this.startAt = startAt; this.sec = null; this._perfFor = -1;
     this.el.preservesPitch = true; this.el.playbackRate = 1;
     return new Promise((resolve, reject) => {
       const el = this.el; let done = false;
@@ -684,6 +685,12 @@ class Deck {
     set(this.flWet.gain, 0); set(this.flFb.gain, 0); set(this.phWet.gain, 0); set(this.gate.gain, 1);
     this.hp.Q.setValueAtTime(0.9, t); this.lp.Q.setValueAtTime(0.9, t);
   }
+  /* back to the knobs for what performance moves touch (EQ low, HP, gate, loop, echo) — leaves a running swell alone */
+  restoreMain(t, tc = 0.03) {
+    const k = this.knob, f = filterFreqs(k.filter), set = (param, v) => { hold(param, t); glide(param, v, t, tc); };
+    set(this.low.gain, k.low); set(this.hp.frequency, f.hp); set(this.gate.gain, 1); set(this.dSend.gain, k.delay * 0.8); set(this.dFb.gain, 0.3 + k.delay * 0.3);
+    set(this.loopDry.gain, 1); set(this.loopIn.gain, 1); set(this.loopWet.gain, 0); set(this.loopFb.gain, 0); this.hp.Q.setValueAtTime(0.9, t);
+  }
   /* cancel a running "ride" (see ride()) and glide its params back to the knob settings */
   unride(t = ctx.currentTime) {
     if (!(this._rideUntil > t)) return;
@@ -710,6 +717,20 @@ class Deck {
     }, startIn);
     hold(this.lp.frequency, t); expo(this.lp.frequency, 900, t + dur);
   }
+  /* mid-track tape stop that lands back on the beat: slow down over `dur`, then restart at track time `resumeAt` */
+  brakeDrop(t, dur, resumeAt) {
+    const startIn = Math.max(0, (t - ctx.currentTime) * 1000), el = this.el, tr = this.track;
+    setTimeout(() => {
+      if (this.track !== tr || el.paused) return;
+      const r0 = el.playbackRate || 1, t0 = performance.now(); S.braking = true;
+      el.preservesPitch = false; el.webkitPreservesPitch = false;
+      const step = () => { if (this.track !== tr) { S.braking = false; return; } const x = (performance.now() - t0) / (dur * 1000);
+        if (x >= 1) { el.currentTime = resumeAt; el.playbackRate = r0; el.preservesPitch = true; el.webkitPreservesPitch = true; S.braking = false; return; }
+        el.playbackRate = Math.max(0.1, r0 * Math.pow(1 - x, 1.5)); requestAnimationFrame(step); };
+      requestAnimationFrame(step);
+    }, startIn);
+  }
+  secLevel() { this.secAn.getFloatTimeDomainData(this.secBuf); let s = 0; for (const x of this.secBuf) s += x * x; return Math.sqrt(s / this.secBuf.length); }
   vuLevel() { this.vu.getFloatTimeDomainData(this.vuBuf); let s = 0; for (const x of this.vuBuf) s += x * x; return Math.sqrt(s / this.vuBuf.length); }
 }
 function filterFreqs(x) {
@@ -725,11 +746,11 @@ function freqsToFilter(hp, lp) {
 }
 /* ---------- mixing engine ---------- */
 const S = { set: [], idx: -1, decks: [], live: null, playing: false, paused: false, inTrans: false, transAt: Infinity, segStart: 0,
-  lastScript: '', lastFlourish: -1, lastRiser: -1, buildId: 0, params: null, extending: false, braking: false, preloading: null };
+  lastScript: '', perfLog: [], plan: null, lastFlourish: -1, lastRiser: -1, buildId: 0, params: null, extending: false, braking: false, preloading: null };
 const opt = id => $('#' + id);
 const xfLen = () => +opt('xfLen').value;
 const perTrack = () => +opt('perTrack').value;
-const fxAmt = () => ({ subtle: 0.1, normal: 0.22, wild: 0.42 })[opt('fxAmt').value] || 0.22;
+const fxAmt = () => ({ smooth: 0.1, club: 0.25, wild: 0.42 })[opt('fxAmt').value] || 0.25;   // the Hype select (Smooth / Club / Wild)
 const isChillSet = () => { const p = S.params || {}; return (p.moods || []).some(m => m === 'chill' || m === 'dreamy') || (p.genres || []).some(g => g === 'lofi' || g === 'downtempo' || g === 'hiphop'); };
 
 function ensureAudio() {
@@ -758,7 +779,13 @@ function computeTransAt() {
   const tr = d.track, bs = 60 / (tr.bpm || 120), ph = d.phase, start = S.segStart;
   const dur = tr.dur || d.el.duration || 180;
   let end = perTrack() > 0 && !tr.preview ? Math.min(dur - 1, start + perTrack()) : dur - 0.6;
-  const xft = Math.min(xfLen() * (d.el.playbackRate || 1), (end - start) * 0.4);
+  let xft = Math.min(xfLen() * (d.el.playbackRate || 1), (end - start) * 0.4);
+  // Hype: plan a long mashup into the next track (decided once per pair) and leave room for it
+  const H = hype(), nx = S.set[nextIdx(S.idx + 1)];
+  if (H && nx && !tr.preview && !nx.preview && tr.bpm && nx.bpm && opt('tempoSync').checked && Math.abs(tempoRatio(nx.bpm, tr.bpm * (d.el.playbackRate || 1)) - 1) <= 0.08) {
+    const key = tr.id + '>' + nx.id; if (!S.plan || S.plan.key !== key) S.plan = { key, script: planMash(tr, nx, H) };
+    if (S.plan.script) xft = Math.max(xft, Math.min(SCRIPTS[S.plan.script].beats(H) * bs, (end - start) * 0.5));
+  } else S.plan = null;
   let at = end - xft;
   if (!tr.preview) {   // land the mix on a phrase boundary when possible
     const b = (at - ph) / bs; const p16 = ph + Math.floor(b / 16) * 16 * bs, p4 = ph + Math.floor(b / 4) * 4 * bs;
@@ -802,6 +829,13 @@ async function playFrom(i) {
   setStatus('Live', 'ok'); renderAll(); preloadNext();
 }
 
+function planMash(a, b, H) {
+  if (rng() > H.mash) return null;
+  const compat = !!(a.cam && b.cam && keyDist(a.cam, b.cam) <= 1);
+  if (compat && (a.energy ?? .5) > 0.5 && (b.energy ?? .5) > 0.5 && rng() < H.dbl / H.mash) return 'double';
+  if (compat && rng() < H.vocal / H.mash) return 'vocal';
+  return pick(['mashup', 'mashloop']);
+}
 function chooseScript(D, I, synced) {
   if (!opt('autoFx').checked) return 'fade';
   const dE = (I.track.energy ?? .5) - (D.track.energy ?? .5);
@@ -866,6 +900,42 @@ const SCRIPTS = {
     showFx('STUTTER 1/16 → 1/32', T1 - 2 * B, false, 2 * B, D.name);
     I.xf.gain.setValueAtTime(0, T); I.xf.gain.setValueAtTime(0, T1 - 0.004); lin(I.xf.gain, 1, T1 + 0.004); Master.impact(T1, 0.5); showFx('IMPACT', T1, false, 0.7);
     return { inAt: T1, end: T1 }; } },
+  /* Hype mashups (planned in computeTransAt; tempo-synced only) — lows from one deck, mids / highs from the other */
+  mashup: { label: 'MASHUP · DRUMS UNDER', n: 'm', beats: H => H.mashBeats, fn(D, I, T, B, n) {
+    const T1 = T + n * B, h = T + Math.round(n / 2) * B;
+    [I.mid.gain, I.high.gain].forEach(p => hold(p, T)); I.mid.gain.setValueAtTime(-18, T); I.high.gain.setValueAtTime(-9, T);   // next track's kick + bass under this one
+    curve(I.xf.gain, 0, 0.9, T, T + 4 * B); D.xf.gain.setValueAtTime(1, T);
+    D.low.gain.setValueAtTime(D.knob.low, T + 3.75 * B); lin(D.low.gain, -30, T + 4 * B); showFx('BASS SWAP', T + 3 * B, false, 1.5 * B, D.name + '→' + I.name, 'perf');
+    I.mid.gain.setValueAtTime(-18, h); lin(I.mid.gain, I.knob.mid, h + 2 * B); I.high.gain.setValueAtTime(-9, h); lin(I.high.gain, I.knob.high, h + 2 * B);
+    I.xf.gain.setValueAtTime(0.9, h); lin(I.xf.gain, 1, h + 2 * B);
+    curve(D.xf.gain, 1, 0, h, T1); D.hp.frequency.setValueAtTime(filterFreqs(D.knob.filter).hp, h); expo(D.hp.frequency, 420, T1); D.echo(T1 - 2 * B, 0.55, 0.5, 0.75);
+    showFx('HANDS OVER · TOPS', h, false, 2 * B, I.name, 'perf'); showFx('ECHO THROW', T1 - 2 * B, false, 2 * B, D.name, 'perf');
+    return { inAt: T, end: T1 }; } },
+  mashloop: { label: 'MASHUP · LOOP UNDER', n: 'm', beats: H => H.mashBeats, fn(D, I, T, B, n) {
+    const T1 = T + n * B, L = 4 * B, l0 = T + L, l1 = T + 16 * B;
+    [I.mid.gain, I.high.gain].forEach(p => hold(p, T)); I.mid.gain.setValueAtTime(-12, T); I.high.gain.setValueAtTime(-4, T);
+    curve(I.xf.gain, 0, 0.72, T, T + B);
+    I.loopOn(l0, L); I.loopOff(l1); showFx('LOOP 1 BAR × 3 · ' + I.name, l0, false, l1 - l0, I.name, 'perf');   // the next track's first bar, looped under this one
+    D.xf.gain.setValueAtTime(1, T); D.low.gain.setValueAtTime(D.knob.low, l1 - 0.25 * B); lin(D.low.gain, -30, l1);
+    I.mid.gain.setValueAtTime(-12, l1); lin(I.mid.gain, I.knob.mid, l1 + 2 * B); I.high.gain.setValueAtTime(-4, l1); lin(I.high.gain, I.knob.high, l1 + 2 * B);
+    I.xf.gain.setValueAtTime(0.72, l1); lin(I.xf.gain, 1, l1 + 2 * B); Master.impact(l1, 0.45); showFx('BASS SWAP', l1 - B, false, 1.5 * B, D.name + '→' + I.name, 'perf');
+    curve(D.xf.gain, 1, 0, l1, T1); D.hp.frequency.setValueAtTime(filterFreqs(D.knob.filter).hp, l1); expo(D.hp.frequency, 450, T1); D.echo(T1 - 2 * B, 0.5, 0.5, 0.75);
+    return { inAt: T, end: T1 }; } },
+  double: { label: 'DOUBLE DROP', n: 'm', beats: () => 16, fn(D, I, T, B, n) {
+    const T1 = T + n * B;
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 0.85, T + 0.004); D.xf.gain.setValueAtTime(1, T - 0.004); lin(D.xf.gain, 0.85, T + 0.004);
+    D.low.gain.setValueAtTime(D.knob.low, T - 0.004); lin(D.low.gain, -40, T + 0.004); Master.impact(T, 0.8);   // both drops, one bass (the incoming)
+    D.xf.gain.setValueAtTime(0.85, T1 - 2 * B); lin(D.xf.gain, 0, T1); I.xf.gain.setValueAtTime(0.85, T1 - 2 * B); lin(I.xf.gain, 1, T1);
+    D.echo(T1 - 2 * B, 0.6, 0.5, 0.75); showFx('ECHO THROW', T1 - 2 * B, false, 2 * B, D.name, 'perf');
+    return { inAt: T, end: T1 }; } },
+  vocal: { label: 'VOCAL OVER BEAT', n: 'm', beats: () => 16, fn(D, I, T, B, n) {
+    const T1 = T + n * B, fD = filterFreqs(D.knob.filter);
+    D.xf.gain.setValueAtTime(1, T); D.hp.frequency.setValueAtTime(Math.max(10, fD.hp), T); expo(D.hp.frequency, 380, T + 2 * B);   // outgoing: vocal band only
+    D.lp.frequency.setValueAtTime(fD.lp, T); expo(D.lp.frequency, 7000, T + 2 * B);
+    hold(I.mid.gain, T); I.mid.gain.setValueAtTime(-7, T); curve(I.xf.gain, 0, 1, T, T + 2 * B);   // incoming: the beat, mids pulled back to make room
+    D.xf.gain.setValueAtTime(1, T1 - 4 * B); curve(D.xf.gain, 1, 0, T1 - 4 * B, T1); D.rSend.gain.setValueAtTime(D.knob.reverb * 0.9, T1 - 4 * B); lin(D.rSend.gain, 0.5, T1);
+    I.mid.gain.setValueAtTime(-7, T1 - 4 * B); lin(I.mid.gain, I.knob.mid, T1);
+    return { inAt: T, end: T1 }; } },
   brake: { label: 'TAPE STOP', n: 4, fn(D, I, T, B, n) {
     const T1 = T + n * B, bt = T1 - 2 * B;
     S.braking = true; D.brake(bt, 2 * B); showFx('TAPE STOP', bt, false, 2 * B, D.name);
@@ -892,10 +962,11 @@ async function transition(kind = 'auto', toIdx = null, forceScript = null) {
   const ratio = tempoRatio(inBpm, outBpm);   // multiply incoming rate by this
   const synced = !!(D.track.bpm && tr.bpm && Math.abs(ratio - 1) <= 0.08 && opt('tempoSync').checked);
   I.el.playbackRate = synced ? ratio : 1; I.el.preservesPitch = true;
-  const script = forceScript || (kind === 'quick' ? (synced ? pick(['filter', 'echo', 'roll']) : 'echo') : chooseScript(D, I, synced));
+  const planned = kind === 'auto' && synced && S.plan && S.plan.script && S.plan.key === D.track.id + '>' + tr.id ? S.plan.script : null;
+  const script = forceScript || planned || (kind === 'quick' ? (synced ? pick(['filter', 'echo', 'roll']) : 'echo') : chooseScript(D, I, synced));
   const SC = SCRIPTS[script]; S.lastScript = script;
   const B = D.beatSec;
-  let n = SC.n === 'x' ? Math.max(4, Math.round(xfLen() / B / 4) * 4) : SC.n;
+  let n = SC.n === 'm' ? SC.beats(hype() || HYPE.club) : SC.n === 'x' ? Math.max(4, Math.round(xfLen() / B / 4) * 4) : SC.n;
   if (kind === 'quick' && SC.n === 'x') n = Math.min(n, 8);
   if (tr.preview || D.track.preview) n = Math.min(n, Math.max(2, Math.floor(8 / B)));
   const remain = ((D.track.dur || D.el.duration) - D.el.currentTime) / (D.el.playbackRate || 1) - 0.3;
@@ -903,7 +974,7 @@ async function transition(kind = 'auto', toIdx = null, forceScript = null) {
   if (dt + n * B > remain) { dt = D.untilBeat(1, 0.08); n = Math.max(1, Math.min(n, Math.floor((remain - dt) / B))); }
   const T = ctx.currentTime + dt;
   D.unride(); I.unride();
-  [D, I].forEach(x => { [x.xf.gain, x.low.gain, x.hp.frequency, x.lp.frequency, x.rSend.gain, x.dSend.gain].forEach(p => hold(p, T)); });
+  [D, I].forEach(x => { [x.xf.gain, x.low.gain, x.mid.gain, x.high.gain, x.hp.frequency, x.lp.frequency, x.rSend.gain, x.dSend.gain, x.gate.gain].forEach(p => hold(p, T)); });
   I.restore(ctx.currentTime, 0.01); I.xf.gain.setValueAtTime(0, ctx.currentTime);
   D.auto = I.auto = true;
   const r = SC.fn(D, I, T, B, n);
@@ -958,7 +1029,7 @@ function tick() {
   if (!S.inTrans) {
     if (t >= S.transAt || d.el.ended) { transition('auto'); return; }
     const r = d.el.playbackRate; if (!S.braking && Math.abs(r - 1) > 0.0005) d.el.playbackRate = r + Math.sign(1 - r) * Math.min(0.00025, Math.abs(1 - r));
-    if (opt('autoFx').checked) { flourish(d, t); ride(d, t); }
+    if (opt('autoFx').checked) { trackSection(d); if (hype()) perform(d, t); else flourish(d, t); ride(d, t); }
   }
 }
 
@@ -992,8 +1063,8 @@ function ride(d, t) {
   if (ahead > 1.4 || ahead < 0.25 || d._rideFor === ph) return;
   d._rideFor = ph;
   const now = ctx.currentTime, t0 = now + ahead * B, toMix = (S.transAt - t) / (d.el.playbackRate || 1);
-  if (d._rideUntil > now || toMix < (ahead + 18) * B) return;
-  if (rng() > clamp(fxAmt() * 2.2, 0.25, 0.8)) return;
+  if (d._rideUntil > now || d._perfUntil > now || d._modUntil > now || toMix < (ahead + 18) * B) return;
+  if (rng() > clamp(fxAmt() * 2.2, 0.25, 0.8) * (hype() ? 0.5 : 1)) return;
   const chill = isChillSet() ? 0 : 1;
   const opts = Object.entries(RIDES).filter(([k, R]) => (!R.ok || R.ok(d)) && !(k === 'hpTease' && (ph + 16) % 32 === 0) && Object.keys(d.grab).every(g => !d.grab[g]));
   if (!opts.length) return;
@@ -1001,6 +1072,86 @@ function ride(d, t) {
   for (const [k, R] of opts) { x -= R.w[chill]; if (x <= 0) { key = k; break; } }
   d._ridden = []; const [a, e] = RIDES[key].fn(d, t0, B); d._rideUntil = e;
   showFx(RIDES[key].label, a, false, e - a, d.name, 'ride');
+}
+
+/* ---------- Hype: mid-track performance (all scripted, beat / phrase aligned) ----------
+ * Smooth = the gentle flourishes + rides above; Club / Wild = perform() below, ~5 / ~10 moves a minute, more in drops
+ * and builds, few in breakdowns. Sections come from the deck's pre-FX level: fast vs slow average + per-bar history. */
+const HYPE = {
+  club: { perMin: 7, mash: 0.45, dbl: 0.12, vocal: 0.12, brake: 0.05, mashBeats: 32 },
+  wild: { perMin: 13, layers: true, mash: 0.65, dbl: 0.3, vocal: 0.2, brake: 0.14, mashBeats: 32 },
+};
+const hype = () => (opt('autoFx').checked && HYPE[opt('fxAmt').value]) || null;
+function trackSection(d) {
+  if (!d.track || !d.track.an) return;
+  const s = d.sec || (d.sec = { fast: 0, slow: 0, bars: [], acc: 0, n: 0, bar: -1, max: 0, lowRun: 0, name: 'groove' });
+  const l = d.secLevel(), B = d.beatSec, a1 = 1 - Math.exp(-0.1 / (2 * B)), a2 = 1 - Math.exp(-0.1 / (24 * B));
+  if (!s.slow) s.fast = s.slow = l;
+  s.fast += a1 * (l - s.fast); s.slow += a2 * (l - s.slow);
+  const bar = Math.floor(d.beatPos() / 4);
+  if (bar !== s.bar) {
+    if (s.n) { const v = s.acc / s.n; s.bars.push(v); if (s.bars.length > 16) s.bars.shift(); s.max = Math.max(s.max * 0.97, v); }   // loudest recent bar
+    s.bar = bar; s.acc = 0; s.n = 0; s.name = sectionOf(d); s.lowRun = s.name === 'breakdown' ? s.lowRun + 1 : 0;
+  }
+  s.acc += l; s.n++;
+}
+function sectionOf(d) {
+  const s = d.sec; if (!s || s.bars.length < 3) return 'groove';
+  const b = s.bars, last = b[b.length - 1], prev = b[Math.max(0, b.length - 4)], r = s.fast / (s.slow + 1e-6);
+  if (r < 0.7 || last < 0.55 * s.max) return 'breakdown';
+  if (last > prev * 1.15 && r < 1.08) return 'build';
+  if (r > 1.1 || last > 0.9 * s.max) return 'drop';
+  return 'groove';
+}
+/* moves: where = 'last' (last bar of a 16-beat phrase), 'half' (8 beats from a phrase start or middle), 'bar2' (beats 8–16, into
+ * the next phrase), 'bar1'; w = weight per section; fn(d, t0 bar start, B, H) -> [start, end, label] */
+const MOVES = {
+  roll:    { where: 'last', w: { drop: 1.2, groove: 1, build: 1, breakdown: 0.2 }, fn(d, t0, B) { const a = t0 + 2 * B; d.loopOn(a, B / 2); d.loopLen(t0 + 3 * B, B / 4); d.loopLen(t0 + 3.5 * B, B / 8); d.loopOff(t0 + 4 * B); return [a, t0 + 4 * B, 'LOOP ROLL ½ → ⅛']; } },
+  stutter: { where: 'last', w: { drop: 1, groove: 0.7, build: 0.8, breakdown: 0.1 }, fn(d, t0, B) { d.stutter(t0 + 3 * B, t0 + 3.5 * B, B / 4); d.stutter(t0 + 3.5 * B, t0 + 4 * B, B / 8); return [t0 + 3 * B, t0 + 4 * B, 'STUTTER']; } },
+  throw:   { where: 'last', w: { drop: 0.8, groove: 1, build: 0.6, breakdown: 1 }, fn(d, t0, B) { const a = t0 + 3 * B; d.echo(a, 0.6, 0.5, 0.75); hold(d.dSend.gain, a + B * 0.6); glide(d.dSend.gain, d.knob.delay * 0.8, a + B * 0.6, 0.02); return [a, t0 + 4 * B + B, 'ECHO THROW']; } },
+  bassKill:{ where: 'last', w: { drop: 1.3, groove: 1, build: 0.5, breakdown: 0 }, fn(d, t0, B) { const a = t0 + 3 * B, e = t0 + 4 * B; hold(d.low.gain, a); glide(d.low.gain, -40, a, 0.006); d.low.gain.setValueAtTime(-40, e - 0.004); lin(d.low.gain, d.knob.low, e); return [a, e + 0.05, 'BASS KILL → 1']; } },
+  brake:   { where: 'last', w: { drop: 0.3, groove: 0.4, build: 1, breakdown: 1 }, hype: 'brake', fn(d, t0, B) {
+    const a = t0 + 3 * B, at = d.phase + (d._perfFor + 4) * 60 / (d.track.bpm || 120);   // track time of the next phrase's 1
+    d.brakeDrop(a, B * 0.92, at); Master.impact(t0 + 4 * B, 0.55); return [a, t0 + 4 * B, 'TAPE STOP → DROP']; } },
+  gate:    { where: 'half', w: { drop: 1.3, groove: 0.8, build: 0.5, breakdown: 0.1 }, fn(d, t0, B) {
+    const p = d.gate.gain, div = B / 4, e = t0 + 8 * B; hold(p, t0);
+    for (let t = t0; t < e - 1e-4; t += div) { glide(p, 1, t, 0.002); glide(p, 0.14, t + div * 0.55, 0.004); }
+    glide(p, 1, e, 0.004); return [t0, e, 'TRANCE GATE ⅛ × 8']; } },
+  flange:  { where: 'half', layer: 'mod', w: { drop: 0.5, groove: 0.9, build: 0.8, breakdown: 0.5 }, fn(d, t0, B) { d.flanger(t0, true); d.flanger(t0 + 7.5 * B, false); return [t0, t0 + 8 * B, 'FLANGER SWELL']; } },
+  phaser:  { where: 'half', layer: 'mod', w: { drop: 0.3, groove: 0.7, build: 0.5, breakdown: 0.9 }, fn(d, t0, B) { d.phaser(t0, true); d.phaser(t0 + 7.5 * B, false); return [t0, t0 + 8 * B, 'PHASER SWELL']; } },
+  chop:    { where: 'bar1', w: { drop: 1.2, groove: 0.6, build: 0, breakdown: 0 }, fn(d, t0, B) {
+    [1, 3].forEach(k => { const a = t0 + k * B; hold(d.low.gain, a); glide(d.low.gain, -32, a, 0.005); glide(d.low.gain, d.knob.low, a + B / 2, 0.006); }); return [t0 + B, t0 + 4 * B, 'BASS CHOP']; } },
+  build:   { where: 'bar2', w: { drop: 0, groove: 0.25, build: 2.2, breakdown: 1.6 }, fn(d, t0, B) {
+    const e = t0 + 8 * B, f = filterFreqs(d.knob.filter), hp = d.hp.frequency;
+    Master.riser(t0, 8 * B); hold(hp, t0); hp.setValueAtTime(Math.max(10, f.hp), t0); expo(hp, 950, e - 0.03); hp.setValueAtTime(Math.max(10, f.hp), e);
+    d.stutter(t0 + 4 * B, t0 + 6 * B, B / 2); d.stutter(t0 + 6 * B, t0 + 7 * B, B / 4); d.stutter(t0 + 7 * B, e, B / 8);   // snare-roll style gate ramp
+    Master.impact(e, 0.6); return [t0, e, 'BUILD → DROP']; } },
+};
+function perform(d, t) {
+  const H = hype(), tr = d.track; if (!H || !tr || !tr.an || tr.preview) return;
+  const B = d.beatSec, bpos = d.beatPos(); if (bpos < 6) return;
+  const nb = Math.ceil(bpos / 4) * 4, ahead = nb - bpos;
+  if (ahead > 1.4 || ahead < 0.2 || d._perfFor === nb) return;
+  d._perfFor = nb;
+  const now = ctx.currentTime, t0 = now + ahead * B, toMix = (S.transAt - t) / (d.el.playbackRate || 1);
+  if (toMix < (ahead + 14) * B || d._rideUntil > now || S.braking || Object.values(d.grab).some(Boolean)) return;
+  const mainBusy = d._perfUntil > now, modBusy = d._modUntil > now;   // Wild layers a flanger / phaser swell under the other moves
+  const free = M => M.layer === 'mod' ? !modBusy && (H.layers || !mainBusy) : !mainBusy && (H.layers || !modBusy);
+  if (mainBusy && modBusy) return;
+  const sec = (d.sec && d.sec.name) || 'groove', barIn = (nb / 4) % 4;
+  const where = barIn === 3 ? 'last' : barIn === 2 ? 'bar2' : barIn === 1 ? 'bar1' : 'half';
+  const mul = { drop: 1.6, build: 1.3, groove: 1, breakdown: 0.35 }[sec];
+  let p = clamp(H.perMin * mul * (4 * B) / 60, 0, 0.85);
+  const fits = Object.entries(MOVES).filter(([k, M]) => free(M) && (M.where === where || (where === 'bar2' && M.where === 'half')) && M.w[sec] > 0 && (!M.hype || rng() < H[M.hype] * 4));
+  if (where === 'bar2' && (sec === 'build' || (sec === 'breakdown' && d.sec && d.sec.lowRun >= 2))) p = Math.min(0.9, p * 2.5);   // a drop is likely at the next phrase
+  if (!fits.length || rng() > p) return;
+  let tot = fits.reduce((a, [, M]) => a + M.w[sec], 0), x = rng() * tot, key = fits[0][0];
+  for (const [k, M] of fits) { x -= M.w[sec]; if (x <= 0) { key = k; break; } }
+  const [a, e, label] = MOVES[key].fn(d, t0, B, H);
+  S.perfLog.push({ at: a, key, sec, deck: d.name }); showFx(label, a, false, e - a, d.name, 'perf');
+  if (MOVES[key].layer === 'mod') { d._modUntil = e; return; }   // swells switch themselves off
+  d._perfUntil = e; d.auto = true;
+  setTimeout(() => { if (!S.inTrans && d === S.live && d._perfUntil === e) { d.restoreMain(ctx.currentTime, 0.03); d.auto = false; } }, (e - ctx.currentTime) * 1000 + 30);
 }
 
 /* ---------- steering: genre / mood chips changed while playing -> morph the upcoming queue ---------- */
@@ -1128,7 +1279,7 @@ function setStatus(text, kind = '') { $('#statusText').textContent = text; $('#s
 /* FX timeline: every effect (pads, transition scripts, flourishes, rides) becomes a chip with a progress bar;
  * pads light from the real audio state of the decks (see updateDecks) and from this timeline */
 const fxNow = () => ctx ? ctx.currentTime : performance.now() / 1000;
-const FX_PAD = [[/RISER/, 'riser'], [/IMPACT/, 'impact'], [/LOOP|ROLL/, 'loop'], [/STUTTER/, 'stutter'], [/ECHO/, 'echo'], [/FILTER|SWEEP|DIP|LP |HP /, 'sweep'],
+const FX_PAD = [[/RISER|BUILD/, 'riser'], [/GATE|CHOP/, 'stutter'], [/IMPACT/, 'impact'], [/LOOP|ROLL/, 'loop'], [/STUTTER/, 'stutter'], [/ECHO/, 'echo'], [/FILTER|SWEEP|DIP|LP |HP /, 'sweep'],
   [/FLANG/, 'flanger'], [/PHASER/, 'phaser'], [/REVERB|WASH|SWELL|VERB/, 'wash'], [/TAPE/, 'brake']];
 const fxq = []; let lastFx = null;
 function showFx(label, atCtx, major = false, dur = 0, deck = null, kind = '') {
@@ -1166,7 +1317,7 @@ function buildSources() { const cur = opt('source').value; opt('source').innerHT
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
 const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiModel'];
-function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
+function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
 function saveOpts() { const o = {}; PERSIST.forEach(k => { const el = opt(k); if (el) o[k] = el.type === 'checkbox' ? el.checked : el.value; }); localStorage.setItem('neondj.opts', JSON.stringify(o)); }
 
 async function build() {
@@ -1633,6 +1784,6 @@ function init() {
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
   });
-  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, build, digCrates, sequence, analyzeTrack, transition, SCRIPTS });   // for debugging / tests (+ .providers)
+  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, build, digCrates, sequence, analyzeTrack, transition, SCRIPTS, Master, MOVES });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();

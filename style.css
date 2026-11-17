@@ -381,3 +381,5 @@ details.ai .lbl{margin-top:14px}
 .list:not(.show-disliked) #dislikedList{display:none}
 .tracks.disliked li.empty .ei{color:#ff6b5c;border-color:#ff6b5c55;background:radial-gradient(circle,#ff6b5c22,transparent 70%);box-shadow:0 0 22px #ff6b5c22}
 .tracks.disliked li.empty .ei .dico{width:20px;height:20px}
+.fxchip.perf{border-color:#00ff9c66;color:#d9ffe9}
+.fxchip.perf i{background:linear-gradient(90deg,#00ff9c,#b6ff6a)}
