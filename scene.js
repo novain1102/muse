@@ -33,9 +33,9 @@
     for (const t of tracks) {
       const as = [...new Set(artistsOf(t).concat(featOf(t)))];
       as.forEach(a => as.forEach(b => link(a, b)));
-      if (t.album && as.some(a => S.has(a) || [...S].some(s => a.includes(s)))) albumsOfSeeds.add(norm(t.album));
+      if (t.album && as.some(a => S.has(a) || (/[^\x00-\x7f]/.test(a) && [...S].some(s => a.includes(s))))) albumsOfSeeds.add(norm(t.album));
     }
-    const isSeed = a => S.has(a) || [...S].some(s => s.length >= 3 && a.includes(s));   // "艾志恒asen" ∋ "asen"
+    const isSeed = a => S.has(a) || (/[^\x00-\x7f]/.test(a) && [...S].some(s => s.length >= 3 && a.includes(s)));   // "艾志恒asen" ∋ "asen" (CJK + latin alias only; "futurebeats" ≠ "future")
     const all = new Set([...edges.keys()]); tracks.forEach(t => artistsOf(t).forEach(a => all.add(a)));
     all.forEach(a => { if (isSeed(a)) w.set(a, 1); });
     const hop = (base, k, cap) => { const nw = new Map(); edges.forEach((m, a) => { if (w.get(a) >= 1) return; let s = 0; m.forEach((c, b) => { const wb = base.get(b) || 0; if (wb) s += k * wb * Math.min(2, c); }); if (s) nw.set(a, Math.min(cap, s)); }); return nw; };

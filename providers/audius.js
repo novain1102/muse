@@ -68,7 +68,7 @@
         art: art['480x480'] || art['150x150'] || '', artMirrors: art.mirrors || [], artSmall: art['150x150'] || art['480x480'] || '', dur: t.duration || 0, preview: false,
         bpm: t.bpm && t.bpm > 50 && t.bpm < 200 ? +t.bpm : null, key: t.musical_key || null,
         genre: t.genre || '', mood: t.mood || '', tags: t.tags || '', url: this.streamUrl(t.id), alt: (t.stream && t.stream.url) || null, link: t.permalink ? 'https://audius.co' + t.permalink : '',
-        plays: t.play_count || 0, prior: MOOD_E[t.mood] ?? 0.5,
+        plays: t.play_count || 0, prior: MOOD_E[t.mood] ?? 0.5, year: +String(t.release_date || t.created_at || '').slice(0, 4) || null,
         playable: t.is_streamable !== false && !t.is_stream_gated,
         listed: !t.is_unlisted && (!t.access || t.access.stream !== false),
         signals: { rawTitle: t.title || '', plays: t.play_count || 0, likes: t.favorite_count || 0, reposts: t.repost_count || 0,

@@ -15,7 +15,7 @@
       'disco':       ['nu disco', '迪斯科', 'disco', 'funk disco'],
       'dnb':         ['drum and bass', '鼓打贝斯', 'liquid dnb', 'jungle'],
       'bass':        ['dubstep', '回响贝斯', 'future bass', 'bass music'],
-      'hiphop':      ['instrumental hip hop', '嘻哈 伴奏', 'boom bap', 'jazz rap'],
+      'hiphop':      ['trap', '欧美说唱', 'melodic trap', 'trap rap'],
       'lofi':        ['lofi', 'lo-fi', '低保真', 'lofi 学习', 'chillhop'],
       'downtempo':   ['downtempo', 'chillout', '氛围音乐', 'trip hop', 'ambient'],
     },

@@ -16,7 +16,7 @@
     toTrack(t) {
       return P.normalize({ src: 'itunes', id: 'it' + t.trackId, title: t.trackName, artist: t.artistName, artistId: t.artistId, art: (t.artworkUrl100 || '').replace('100x100', '400x400'),
         artSmall: t.artworkUrl100 || '', dur: 30, fullDur: (t.trackTimeMillis || 0) / 1000, preview: true, bpm: null, key: null, genre: t.primaryGenreName || '', mood: '', tags: '',
-        url: t.previewUrl, link: t.trackViewUrl || '', plays: 0, prior: 0.5, playable: !!t.previewUrl });
+        url: t.previewUrl, link: t.trackViewUrl || '', plays: 0, prior: 0.5, year: +String(t.releaseDate || '').slice(0, 4) || null, playable: !!t.previewUrl });
     },
   };
   P.register(ITunes);

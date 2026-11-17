@@ -68,6 +68,18 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
     outweigh likes; tags you also like aren't counted).
 - All scripted and deterministic. Works through the provider interface, so it carries over to new sources.
 
+## Hip-Hop / Trap
+Modern trap / rap rather than boom-bap. Same generic knobs any genre can use (in `GENRES`):
+- `scene` seed artists — Travis Scott, Drake, Future, 21 Savage, Metro Boomin, Playboi Carti, Don Toliver, Lil Uzi Vert, Gunna,
+  Young Thug, Kendrick Lamar — ranked through `scene.js` (closeness via features / producers / albums);
+- `popTol: 0.6` — popularity tolerance: the anti-chart penalties (play counts, follower counts, the mainstream-name list) are
+  scaled by 1 − popTol, so popular tracks are allowed here;
+- `recent: 2015` — older releases (where the source gives a date) lose 0.4–1.2 points;
+- `vocals: true` — beat / instrumental / "type" uploads lose points, songs with `prod.` / `feat.` gain a little.
+Sources: Audius (default) gives full tracks, but it's independent / underground artists — modern trap, rage, plugg, melodic
+rap, mostly 2020+; major-label artists aren't on it. The seed artists themselves come from iTunes (pick it as the source:
+30-second previews). Kugou / QQ search the seeds too, but most of those songs are paid there.
+
 ## 华语 / C-Pop
 Underground / new-wave Chinese rap and trap. The genre's config is only a handful of **scene seed artists**
 (`GENRES.cpop.scene`: Asen, ThomBoyDontkill, Mac Ova Seas, Sasioverlxrd (SASI on Kugou), 华一龙, APMozart) — no keyword

@@ -44,8 +44,9 @@ const GENRES = {
                   seeds: ['liquid', 'rollers', 'minimal dnb', 'atmospheric', 'jungle', 'deep dnb', 'autonomic', 'halftime'] },
   'bass':       { label: 'Dubstep / Bass', zh: '低音', bpm: [138, 150],
                   seeds: ['deep dubstep', 'dub', 'halftime', '140', 'garage', 'wave', 'future garage', 'sub bass'] },
-  'hiphop':     { label: 'Hip-Hop / Beats', zh: '嘻哈', bpm: [80, 98],
-                  seeds: ['boom bap', 'instrumental', 'jazz rap', 'underground hip hop', 'beat tape', 'abstract', 'soulful beats', 'sample'] },
+  'hiphop':     { label: 'Hip-Hop / Trap', zh: '嘻哈 · Trap · 新派说唱', bpm: [70, 100], popTol: 0.6, recent: 2015, vocals: true,
+                  seeds: ['trap', 'melodic trap', 'rage', 'plugg', 'pluggnb', 'atlanta trap', 'dark trap', 'trap rap', 'melodic rap'],
+                  scene: ['Travis Scott', 'Drake', 'Future', '21 Savage', 'Metro Boomin', 'Playboi Carti', 'Don Toliver', 'Lil Uzi Vert', 'Gunna', 'Young Thug', 'Kendrick Lamar'] },
   'lofi':       { label: 'Lo-Fi', zh: '低保真', bpm: [70, 92],
                   seeds: ['lofi beats', 'jazzhop', 'tape', 'dusty', 'chillhop', 'vinyl', 'rainy', 'mellow'] },
   'downtempo':  { label: 'Downtempo / Ambient', zh: '氛围', bpm: [80, 112],
@@ -104,17 +105,19 @@ function tasteScore(t, ctx) {
   else if (lp < 2) s -= 0.2;
   else if (lp <= 4.7) s += 1;        // ~100 .. 50k plays: the "deeper cuts" sweet spot
   else if (lp <= 5.6) s += 0.2;
-  else if (!ctx.hits) s -= 1.4;      // > ~400k: viral / chart territory (wanted for hit genres like 华语)
+  else if (!ctx.hits) s -= 1.4 * (1 - (ctx.popTol || 0));   // > ~400k: viral / chart territory (hit genres skip it; popTol genres soften it)
   const love = ((sg.likes || 0) + 1.5 * (sg.reposts || 0)) / (p + 25);
   s += clamp(love * 18, 0, 1.3);     // engagement ratio = listeners actually liked it
   const f = sg.followers || 0;
-  if (f > 400000) { if (!ctx.hits) s -= 0.7; } else if (f < 60000) s += 0.3;
+  if (f > 400000) { if (!ctx.hits) s -= 0.7 * (1 - (ctx.popTol || 0)); } else if (f < 60000) s += 0.3;
   let hits = 0; for (const k of ctx.seedTerms) if (blob.includes(k)) hits++;
   s += Math.min(1.6, hits * 0.4);
   if (ctx.genreSet.has(t.genre)) s += 0.8; else if (ctx.genreSet.size) s -= 0.6;
   if (ctx.moodSet.size && t.mood) s += ctx.moodSet.has(t.mood) ? 0.7 : -0.15;
   const aname = sg.artistName ?? t.artist ?? '';
-  if (!ctx.hits && (MAINSTREAM.test(title) || MAINSTREAM.test(aname))) s -= 1.3;   // chart bait / pop re-rubs
+  if (!ctx.hits && (MAINSTREAM.test(title) || MAINSTREAM.test(aname))) s -= 1.3 * (1 - (ctx.popTol || 0));   // chart bait / pop re-rubs
+  if (ctx.vocals) { if (/instrumental|\bbeats?\b|\btype\b|for freestyle|\binst\b/i.test(title)) s -= 1.3; else if (/\bprod\.?\b|\bfeat\.?\b|\bft\.?\b/i.test(title)) s += 0.3; }   // genres that want rap / vocals, not beat uploads
+  if (ctx.recent && t.year && t.year < ctx.recent) s -= 0.4 + 0.8 * Math.min(1, (ctx.recent - t.year) / 5);   // genres that want the current sound
   const uname = aname.toLowerCase();
   if (ctx.genrePhrases.some(gp => uname.includes(gp)) || /music|records? ?label|beats|official/i.test(uname) && /\d{3,}/.test(uname)) s -= 0.8;   // channel-style uploaders
   if (SOFT_PENALTY.test(title) && !ctx.allowEdits) s -= 0.35;
@@ -239,7 +242,7 @@ async function digCrates(args) {
   const moodWords = moods.flatMap(m => MOODS[m].words);
   const seedTerms = new Set([...genres.flatMap(g => GENRES[g].seeds), ...moodWords, ...P.words, ...aiWords].map(s => s.toLowerCase()));
   const bpmRanges = genres.map(g => GENRES[g].bpm); BPM_HOME = bpmRanges;
-  const ctx = { hits: genres.some(g => GENRES[g].hits && !GENRES[g].scene), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
+  const ctx = { hits: genres.some(g => GENRES[g].hits && !GENRES[g].scene), popTol: Math.max(0, ...genres.map(g => GENRES[g].popTol || 0)), vocals: genres.some(g => GENRES[g].vocals), recent: Math.max(0, ...genres.map(g => GENRES[g].recent || 0)), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
     genrePhrases: [...new Set([...srcGenres, 'lofi', 'lo-fi', 'deep house', 'techno', 'house music', 'hip hop', 'drum and bass'].map(x => x.toLowerCase()))].filter(x => x.length > 3) };
   const info = { genres, moods };
 
@@ -365,19 +368,20 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
     G = SC.graph(res, sceneSeeds, res.filter(t => seedQ.has(t._q)));
   }
   if (tx) res = res.concat(await digSimilar(prov, tx.likes, tx.TM, onStatus)).filter(t => !tx.TP.ids.has(tx.T.Likes.key(t)));
-  const beatsy = genres.some(g => g === 'hiphop' || g === 'lofi' || g === 'downtempo');
+  const beatsy = genres.some(g => g === 'lofi' || g === 'downtempo');
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
   const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
   const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|[(（]\s*live\s*[)）]|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
   const fanUpload = t => /《.+》/.test(t.title);   // "《show》song" re-uploads
   const tooOld = t => !!(t._g && GENRES[t._g].minYear && t.year && t.year < GENRES[t._g].minYear);
-  const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && (!MAINSTREAM.test((t.artist || '') + ' ' + t.title) || (t._g && (GENRES[t._g].popTol || 0) >= 0.5)) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
   if (G && !G.empty) {   // scene genres: the shared scorer (seed proximity − mainstream − variety show), only tracks near the scene
     const pop = SC.popularity(res);
     NEONDJ._lastScene = { G, pop, seen: res.length };   // for tests / debugging
-    order = order.map(t => ({ t, x: SC.score(t, { G, pop }) })).filter(o => !o.t._g || !GENRES[o.t._g].scene || o.x.prox >= 0.3)
+    const tol = t => (t._g && GENRES[t._g].popTol) || 0, old = t => { const R = t._g && GENRES[t._g].recent; return R && t.year && t.year < R ? 0.4 + 0.8 * Math.min(1, (R - t.year) / 5) : 0; };
+    order = order.map(t => ({ t, x: SC.score(t, { G, pop, wPop: 1 - tol(t) }) })).map(o => (o.x.s -= old(o.t), o)).filter(o => !o.t._g || !GENRES[o.t._g].scene || o.x.prox >= 0.3)
       .map(o => ({ t: o.t, s: o.x.s + rng() * 0.5 })).sort((a, b) => b.s - a.s).map(o => o.t);
   } else if (order.some(t => SC.variety(t))) order = order.map((t, k) => ({ t, s: -k * 0.01 - 3 * SC.variety(t) })).sort((a, b) => b.s - a.s).map(o => o.t);   // generic: variety-show cuts last
   if (tx) order = order.map((t, k) => ({ t, s: (G ? -k * 0.05 : 0) + tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile (scene genres: on top of the scene rank)
@@ -751,7 +755,7 @@ const opt = id => $('#' + id);
 const xfLen = () => +opt('xfLen').value;
 const perTrack = () => +opt('perTrack').value;
 const fxAmt = () => ({ smooth: 0.1, club: 0.25, wild: 0.42 })[opt('fxAmt').value] || 0.25;   // the Hype select (Smooth / Club / Wild)
-const isChillSet = () => { const p = S.params || {}; return (p.moods || []).some(m => m === 'chill' || m === 'dreamy') || (p.genres || []).some(g => g === 'lofi' || g === 'downtempo' || g === 'hiphop'); };
+const isChillSet = () => { const p = S.params || {}; return (p.moods || []).some(m => m === 'chill' || m === 'dreamy') || (p.genres || []).some(g => g === 'lofi' || g === 'downtempo'); };
 
 function ensureAudio() {
   if (ctx) { if (ctx.state === 'suspended' && !S.paused) ctx.resume(); return; }
