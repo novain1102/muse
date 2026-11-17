@@ -1,4 +1,4 @@
-# Muse — DJ mix studio in your browser
+# Muse — Your AI DJ
 
 Pick a genre/mood (or type a vibe like `深夜 暗黑 hypnotic techno`), press **Generate & Play**.
 The app digs free tracks from the Audius network, listens to them, builds a set that warms up,
