@@ -52,7 +52,7 @@
       return P.normalize({ src: 'kugou', id: 'kg' + String(s.FileHash).toLowerCase(), hash: s.FileHash, title, artist: CN.stripTags(s.SingerName) || 'Unknown',
         artistId: singer.id || CN.stripTags(s.SingerName), art: img.replace('{size}', '400'), artSmall: img.replace('{size}', '150'),
         dur: +s.Duration || 0, preview: false, bpm: null, key: null, genre: '', mood: '', tags: [term, s.trans_param && s.trans_param.language].filter(Boolean).join(', '),
-        url: '', link: 'https://www.kugou.com/yy/html/search.html#searchType=song&searchKeyWord=' + encodeURIComponent(title), plays: +s.OwnerCount || 0, prior: CN.prior(term), year: +(String(s.PublishDate || '').slice(0, 4)) || null,
+        url: '', link: 'https://www.kugou.com/yy/html/search.html#searchType=song&searchKeyWord=' + encodeURIComponent(title), plays: +s.OwnerCount || 0, prior: CN.prior(term), album: CN.stripTags(s.AlbumName || ''), year: +(String(s.PublishDate || '').slice(0, 4)) || null,
         // musicpack_advance = 1: needs Kugou's music pack (paid); Privilege 5 is almost always unavailable too.
         // Filtering here saves a play-info request per paid song; resolveStream() still has the final say.
         playable: !(s.trans_param && s.trans_param.musicpack_advance === 1) && (s.Privilege | 0) !== 5, signals: { tags: term || '' } });

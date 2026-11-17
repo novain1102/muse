@@ -52,8 +52,11 @@ const GENRES = {
                   seeds: ['downtempo', 'trip hop', 'organic', 'chillout', 'balearic', 'dub', 'ethereal', 'ambient'] },
   // 华语: current Chinese hip-hop / trap / club music (+ some modern R&B). Popular tracks wanted (hits: anti-chart scoring
   // relaxed), dug from Chinese sources first (cn: true), modern releases only (minYear, when the source reports a date)
-  'cpop':       { label: '华语 C-Pop', zh: '说唱 · Trap · Club · R&B', bpm: [84, 150], hits: true, cn: true, minYear: 2016,
-                  seeds: ['chinese hip hop', 'chinese trap', 'mandarin rap', 'chinese drill', 'c-rap', 'china club', 'chinese r&b', '华语说唱'] },
+  'cpop':       { label: '华语 C-Pop', zh: '地下说唱 · Trap · 新浪潮', bpm: [84, 150], hits: true, cn: true, minYear: 2016,
+                  seeds: ['chinese hip hop', 'chinese trap', 'mandarin rap', 'chinese drill', 'c-rap', 'chinese underground rap', '华语说唱'],
+                  // scene seed artists (scene.js ranks everything else by closeness to these: collabs, producers, albums, shared results);
+                  // "A|B" = same artist, B is the name the CN catalogues use
+                  scene: ['Asen', 'ThomBoyDontkill', 'Mac Ova Seas', 'Sasioverlxrd|SASI', '华一龙', 'APMozart'] },
 };
 /* ---------- curated crate: moods ---------- */
 const MOODS = {
@@ -236,7 +239,7 @@ async function digCrates(args) {
   const moodWords = moods.flatMap(m => MOODS[m].words);
   const seedTerms = new Set([...genres.flatMap(g => GENRES[g].seeds), ...moodWords, ...P.words, ...aiWords].map(s => s.toLowerCase()));
   const bpmRanges = genres.map(g => GENRES[g].bpm); BPM_HOME = bpmRanges;
-  const ctx = { hits: genres.some(g => GENRES[g].hits), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
+  const ctx = { hits: genres.some(g => GENRES[g].hits && !GENRES[g].scene), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
     genrePhrases: [...new Set([...srcGenres, 'lofi', 'lo-fi', 'deep house', 'techno', 'house music', 'hip hop', 'drum and bass'].map(x => x.toLowerCase()))].filter(x => x.length > 3) };
   const info = { genres, moods };
 
@@ -268,8 +271,12 @@ async function digCrates(args) {
   const uniq = () => { const m = new Map(); raw.forEach(t => { if (t && t.id && !m.has(t.id)) m.set(t.id, t); }); return [...m.values()]; };
   let cands = uniq().filter(t => t.playable !== false && t.listed !== false);
   // score = anti-chart taste filter + (with likes) weighted similarity to the ♥ profile; liked tracks themselves only come back via mixInLikes
-  const scoreAll = list => (TP ? list.filter(t => !TP.ids.has(T.Likes.key(t))) : list).filter(t => !AV || !T.blocked(t, AV))
-    .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); if (AV && avW && s > -50) s -= avW * T.penalty(t, AV); return { t, s }; }).filter(x => x.s > -50);
+  // + the shared scene scorer (scene.js): variety-show penalty always, seed-artist proximity for genres with a scene
+  const SC = NEONDJ.scene, sceneSeeds = genres.flatMap(g => GENRES[g].scene || []).flatMap(x => x.split('|'));
+  const scoreAll = list => { const G = sceneSeeds.length ? SC.graph(list, sceneSeeds) : null;
+    return (TP ? list.filter(t => !TP.ids.has(T.Likes.key(t))) : list).filter(t => !AV || !T.blocked(t, AV))
+    .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); if (AV && avW && s > -50) s -= avW * T.penalty(t, AV);
+      const v = SC.variety(t); if (v) s -= 2 * v; if (G) s += 2 * SC.proximity(t, G); return { t, s }; }).filter(x => x.s > -50); };
   let scored = scoreAll(cands);
   if (scored.length < need * 2) {          // widen: open searches without filters
     onStatus('Finding more tracks…');
@@ -325,43 +332,55 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
   const full = prov.capabilities.fullTrack;
   onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
-  const qs = [], KW = prov.keywords, gOf = new Map(), byArtist = new Map();   // byArtist: artist query -> name the results must be by   // gOf: query -> app genre that asked for it
+  const qs = [], KW = prov.keywords, gOf = new Map();   // gOf: query -> app genre that asked for it
   const add = (q, g) => { q = q.trim(); if (!q || gOf.has(q)) return; gOf.set(q, g); qs.push(q); };
+  const SC = NEONDJ.scene, sceneG = genres.filter(g => GENRES[g].scene), seedQ = new Set();
+  const sceneSeeds = sceneG.flatMap(g => GENRES[g].scene.flatMap(x => x.split('|')));
+  // scene genres: search the seed artists (catalogue name = last alias); everything else is ranked by scene.js
+  sceneG.forEach(g => shuffle(GENRES[g].scene).forEach(x => { const q = x.split('|').pop(); add(q, g); seedQ.add(q); }));
   if (KW && KW.genres) {   // provider vocabulary (e.g. Chinese + English terms for CN platforms)
     for (const g of genres) {
-      const terms = shuffle(KW.genres[g] || [GENRES[g].label]), fl = KW.flavors && KW.flavors[g], artists = KW.artists && KW.artists[g];
-      if (GENRES[g].hits && artists) {   // hit genres: artists' own catalogues first (mood picks, then the wider list + ~1 side-style act), a couple of scene terms last
-        const who = q => byArtist.set(q.trim(), q.replace(/ 说唱$/, '').toLowerCase());
-        if (fl) moods.forEach(m => shuffle(fl[m] || []).slice(0, 3).forEach(q => { add(q, g); who(q); }));
-        shuffle(artists).slice(0, moods.length ? 3 : 5).forEach(q => { add(q, g); who(q); });
-        const side = KW.artists2 && KW.artists2[g]; if (side) shuffle(side).slice(0, 1).forEach(q => { add(q, g); who(q); });
-        terms.slice(0, 2).forEach(q => add(q, g));
-      } else if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
+      if (GENRES[g].scene) continue;
+      const terms = shuffle(KW.genres[g] || [GENRES[g].label]), fl = KW.flavors && KW.flavors[g];
+      if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
       else terms.slice(0, GENRES[g].hits ? 4 : 3).forEach((t, i) => add(t + (moods[0] && i === 1 && !GENRES[g].hits && KW.moods && KW.moods[moods[0]] ? ' ' + pick(KW.moods[moods[0]]) : ''), g));
     }
-  } else for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => add(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''), g)); }
+  } else for (const g of genres) { if (GENRES[g].scene) continue; const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => add(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''), g)); }
   words.slice(0, 3).forEach(w => add(w, null));
   if (tx) tx.T.seedQueries(tx.TP, tx.taste, shuffle).forEach(q => add(q, null));
-  const tag = (q, list) => { const g = gOf.get(q), who = byArtist.get(q);
-    if (who) list = list.filter(t => String(t.artist || '').toLowerCase().includes(who));   // artist search: that artist's own tracks, not covers / namesakes
-    if (g) list.forEach(t => { if (!t.genre) t.genre = GENRES[g].label; t._g = g; if (!who && !t._who) t._scene = true; else { t._who = 1; t._scene = false; } }); return list; };
+  const tag = (q, list) => { const g = gOf.get(q);
+    list.forEach(t => { if (!t._q) t._q = q; });
+    if (g) list.forEach(t => { if (!t.genre) t.genre = GENRES[g].label; t._g = g; }); return list; };
   let res;
   if ((prov.capabilities.searchConcurrency || 3) === 1) {   // throttling source: one search at a time, stop once the crate is deep enough
     res = []; const enough = need * (genres.some(g => GENRES[g].hits) ? 6 : 4);
-    for (const q of qs) { try { res.push(...tag(q, await prov.search(q))); } catch (e) { } if (res.filter(t => t.playable !== false).length >= enough) break; }
+    for (const q of qs) { try { res.push(...tag(q, await prov.search(q))); } catch (e) { } if (!seedQ.has(q) && res.filter(t => t.playable !== false).length >= enough) break; }
   } else res = (await pool(qs, 3, q => prov.search(q).then(list => tag(q, list)))).flat().filter(Boolean);
+  let G = null;
+  if (sceneG.length) {   // second hop: the seeds' strongest collaborators / producers get searched too
+    G = SC.graph(res, sceneSeeds, res.filter(t => seedQ.has(t._q)));
+    const more = SC.expand(G, 6).filter(q => !gOf.has(q)); more.forEach(q => add(q, sceneG[0]));
+    const hop = async q => { try { return tag(q, await prov.search(q)); } catch (e) { return []; } };
+    if ((prov.capabilities.searchConcurrency || 3) === 1) { for (const q of more) res.push(...await hop(q)); } else res.push(...(await pool(more, 3, hop)).flat());
+    G = SC.graph(res, sceneSeeds, res.filter(t => seedQ.has(t._q)));
+  }
   if (tx) res = res.concat(await digSimilar(prov, tx.likes, tx.TM, onStatus)).filter(t => !tx.TP.ids.has(tx.T.Likes.key(t)));
   const beatsy = genres.some(g => g === 'hiphop' || g === 'lofi' || g === 'downtempo');
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
   const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
-  const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
-  const fanUpload = t => { const A = KW && KW.artists && KW.artists[t._g]; return /《.+》/.test(t.title) || !!(A && A.some(a => t.title.includes(a) && !(t.artist || '').includes(a))); };   // "<artist> (song)" re-uploads
+  const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|[(（]\s*live\s*[)）]|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
+  const fanUpload = t => /《.+》/.test(t.title);   // "《show》song" re-uploads
   const tooOld = t => !!(t._g && GENRES[t._g].minYear && t.year && t.year < GENRES[t._g].minYear);
   const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
-  if (genres.some(g => GENRES[g].hits)) order = order.map(t => ({ t, s: (t._g && GENRES[t._g].hits ? Math.log10((t.plays || 0) + 1) * 0.4 + ((t.prior ?? 0.5) - 0.5) * 1.5 - (t._scene ? 1.2 : 0) : 2) + rng() * 1.5 })).sort((a, b) => b.s - a.s).map(x => x.t);   // popular first, with variety
-  if (tx) order = order.map(t => ({ t, s: tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile
+  if (G && !G.empty) {   // scene genres: the shared scorer (seed proximity − mainstream − variety show), only tracks near the scene
+    const pop = SC.popularity(res);
+    NEONDJ._lastScene = { G, pop, seen: res.length };   // for tests / debugging
+    order = order.map(t => ({ t, x: SC.score(t, { G, pop }) })).filter(o => !o.t._g || !GENRES[o.t._g].scene || o.x.prox >= 0.3)
+      .map(o => ({ t: o.t, s: o.x.s + rng() * 0.5 })).sort((a, b) => b.s - a.s).map(o => o.t);
+  } else if (order.some(t => SC.variety(t))) order = order.map((t, k) => ({ t, s: -k * 0.01 - 3 * SC.variety(t) })).sort((a, b) => b.s - a.s).map(o => o.t);   // generic: variety-show cuts last
+  if (tx) order = order.map((t, k) => ({ t, s: (G ? -k * 0.05 : 0) + tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile (scene genres: on top of the scene rank)
   if (av && av.w) order = order.map((t, k) => ({ t, s: -k * 0.05 - av.w * av.T.penalty(t, av.A) })).sort((a, b) => b.s - a.s).map(x => x.t);   // ✕ dislikes: similar artists / tags further down
   const hitsWanted = genres.some(g => GENRES[g].hits);   // hit catalogues are partly paid: try more picks
   if (lazy) {   // confirm each pick actually has a free stream before it enters the set

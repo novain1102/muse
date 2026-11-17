@@ -38,7 +38,7 @@
       const singer = (s.singer && s.singer[0]) || {};
       return P.normalize({ src: 'qqmusic', id: 'qq' + s.songmid, mid: s.songmid, title: CN.stripTags(s.songname) || 'Untitled', artist: (s.singer || []).map(x => x.name).join(', ') || 'Unknown',
         artistId: singer.mid || singer.id || singer.name, art, artSmall: art.replace('300x300', '150x150'), dur: +s.interval || 0, preview: false, bpm: null, key: null,
-        genre: '', mood: '', tags: term || '', url: '', link: 'https://y.qq.com/n/ryqq/songDetail/' + s.songmid, plays: 0, prior: CN.prior(term), year: s.pubtime ? new Date(s.pubtime * 1000).getFullYear() : null,
+        genre: '', mood: '', tags: term || '', url: '', link: 'https://y.qq.com/n/ryqq/songDetail/' + s.songmid, plays: 0, prior: CN.prior(term), album: CN.stripTags(s.albumname || ''), year: s.pubtime ? new Date(s.pubtime * 1000).getFullYear() : null,
         playable: !(s.pay && +s.pay.payplay === 1), signals: { tags: term || '' } });
     },
   };

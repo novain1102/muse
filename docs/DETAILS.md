@@ -8,7 +8,7 @@ builds, peaks and cools down, and mixes it on two decks with beat-synced transit
 - Easiest: double-click `index.html` (Chrome / Edge / Safari / Firefox, internet needed).
 - Or serve the folder: `cd ai-dj && python3 -m http.server 8000` and open http://localhost:8000
 
-No build step, no accounts, no API keys. Files: `index.html`, `style.css`, `app.js`, `taste.js` (likes + taste profile), `providers/`.
+No build step, no accounts, no API keys. Files: `index.html`, `style.css`, `app.js`, `taste.js` (likes, dislikes + taste profile), `scene.js` (shared scene scorer), `providers/`.
 
 ## Music sources (providers)
 Pick one in **Source**. Sources are pluggable (`providers/`, see `../providers/README.md`); `app.js` only sees a normalized `Track`.
@@ -69,15 +69,20 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
 - All scripted and deterministic. Works through the provider interface, so it carries over to new sources.
 
 ## 华语 / C-Pop
-One genre chip for current Chinese hip-hop / trap / club music (Higher Brothers, GAI, 马思唯, 法老, KEY.L刘聪, Vava, 万妮达,
-BrAnTB小胖, 刘柏辛 …) with roughly one search in six going to modern R&B / urban pop (王以太, 刘至佳, Tia Ray袁娅维 …). No folk,
-国风, Cantonese classics or rock. The mood picks which artists are searched, all within the same scene: energetic / dark → hard
-trap / drill / club, groovy → bouncy hip-hop & R&B, chill / dreamy → melodic rap & R&B, happy → party pop-rap, deep → moody trap.
-Artist searches keep only that artist's own tracks (features count against the artist's 2-per-set cap); a couple of scene
-terms (华语说唱, 华语 trap …) fill in. Hits are wanted here, so the anti-chart penalties are off for it. With a non-Chinese source
-selected, the dig goes to Kugou, then QQ (QQ first if QQ is the source); originals only (no DJ edits, remixes, "(Trap)" edits,
-karaoke, covers, 中文版 re-lyrics, re-uploads), and releases before 2016 are dropped where the platform reports a date. Kugou's
-paid songs (music-pack flag) are skipped before any request. If neither finds enough, Audius is searched with Chinese terms.
+Underground / new-wave Chinese rap and trap. The genre's config is only a handful of **scene seed artists**
+(`GENRES.cpop.scene`: Asen, ThomBoyDontkill, Mac Ova Seas, Sasioverlxrd (SASI on Kugou), 华一龙, APMozart) — no keyword
+lists, no artist black- or white-lists. Muse searches the seeds, then their strongest collaborators / producers (second hop),
+and ranks everything with the shared scene scorer (`scene.js`, used by every provider and genre):
+- **scene proximity** from co-occurrence in what the dig saw: seed = 1, featured with / produced for a seed ≈ 0.6–0.9,
+  one more hop ≈ 0.3, same album as a seed track 0.4, showing up in a seed's search results 0.1 each; only tracks at
+  ≥ 0.3 are eligible;
+- **mainstream penalty** from the source's play counts, relative to the pool — per track and per artist (an act's biggest
+  song counts), so scene-acclaimed but not mass-market wins;
+- **variety-show / talent-show penalty** from generic title / album patterns: `(Live)`, 现场, 舞台版, 综艺 / 节目 / 公演,
+  `Ep.3`, 第3期, `《…说唱… / …嘻哈…》` tags and show names (for 华语, `(Live)` cuts are dropped outright);
+- then likes / dislikes (taste.js) on top, as for every genre. Endless mode and steering use the same dig.
+Kugou first, QQ Music next (QQ first if it is the source), Audius with Chinese terms last; originals only, releases before
+2016 dropped where a date is given; Kugou's paid songs are skipped, so what plays is the free part of each catalogue.
 
 ## Steering a playing set (换风格不用重来)
 Change the Genre / Mood chips while a set is playing — no need to press Generate. After ~1.5 s Muse digs the
