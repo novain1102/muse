@@ -18,20 +18,26 @@
       'hiphop':      ['instrumental hip hop', '嘻哈 伴奏', 'boom bap', 'jazz rap'],
       'lofi':        ['lofi', 'lo-fi', '低保真', 'lofi 学习', 'chillhop'],
       'downtempo':   ['downtempo', 'chillout', '氛围音乐', 'trip hop', 'ambient'],
-      'cpop':        ['华语流行', '华语 热歌', '华语金曲', '华语 经典', '华语R&B', '国风', '粤语 经典', '华语说唱', '民谣', '华语 新歌', '华语 原创', '综艺 live'],
+      'cpop':        ['华语说唱', '中文说唱', '华语 trap', '中文 trap', '新说唱', '华语 R&B'],
     },
-    // 华语 sub-flavours picked by mood (one chip, mood chips choose the flavour)
+    // 华语 sub-flavours picked by mood — artists (searched for their own tracks), all hip-hop / trap / club / R&B
     flavors: {
       'cpop': {
-        'chill': ['华语 抒情', '民谣', '华语 治愈'], 'groovy': ['华语R&B', '华语 R&B 律动', '华语 放克'], 'deep': ['粤语 经典', '华语 深情', '粤语 抒情'],
-        'dreamy': ['国风', '古风', '中国风'], 'dark': ['华语说唱', '中文说唱', '华语 摇滚'], 'happy': ['华语 甜歌', '华语流行', '华语 热歌'],
-        'energetic': ['华语说唱', '华语 摇滚', '华语 热歌'],
+        'energetic': ['GAI', '法老', 'BrAnTB小胖', 'Higher Brothers', '艾福杰尼', '黄旭'], 'dark': ['法老', '谢帝', '派克特', '福克斯', '弹壳', 'KEY.L刘聪'],
+        'groovy': ['马思唯', 'Jony J', '王以太', '刘至佳', 'Higher Brothers', 'Vava'], 'chill': ['王以太', '刘柏辛', '沙一汀', '刘至佳', 'Tia Ray袁娅维', '那吾克热'],
+        'dreamy': ['刘柏辛', '沙一汀', '王以太', '欧阳娜娜', 'Capper'], 'happy': ['Vava', '万妮达', '王嘉尔', '蔡徐坤', '布瑞吉', 'J-Fever'],
+        'deep': ['杨和苏', 'KEY.L刘聪', '那吾克热', '法老', 'Jony J'],
       },
     },
-    // popular artists' catalogues for hit-seeking genres (search terms only; what plays is whatever the platform serves free)
+    // artists searched for hit-seeking genres (search terms only; what plays is whatever the platform serves free).
+    // 华语: this generation's rap / trap / club acts …
     artists: {
-      'cpop': ['周杰伦', '林俊杰', '陈奕迅', '邓紫棋', '薛之谦', '李荣浩', '毛不易', '周深', '王菲', '孙燕姿', '五月天', '蔡依林', '张学友', '汪苏泷',
-        '莫文蔚', '陶喆', '王力宏', '田馥甄', '张惠妹', '华晨宇', '许嵩', '李健', '赵雷', '朴树', '告五人', '单依纯', '张杰', '梁静茹', '方大同', '容祖儿', '杨千嬅', '刘惜君'],
+      'cpop': ['Higher Brothers', 'GAI', '马思唯', '谢帝', '艾福杰尼', '那吾克热', '法老', '杨和苏', 'KEY.L刘聪', 'Vava', '万妮达', 'BrAnTB小胖',
+        '刘柏辛', '沙一汀', 'Jony J', 'ICE 说唱', 'Ty. 说唱', 'TT 说唱', '黄旭', '小鬼王琳凯', '派克特', '福克斯', 'J-Fever', '布瑞吉', 'Capper', '弹壳', 'Lil Jet'],
+    },
+    // … plus ~1 in 6 searches for modern R&B / urban pop
+    artists2: {
+      'cpop': ['王以太', '刘至佳', 'Tia Ray袁娅维', '蔡徐坤', '王嘉尔', '欧阳娜娜', '刘雨昕', '周柯宇', '刘耀文'],
     },
     moods: {
       'chill': ['chill', '放松'], 'groovy': ['groove', '律动'], 'deep': ['deep', '深夜'], 'dreamy': ['dreamy', '梦幻'],
@@ -42,6 +48,6 @@
   const https = u => String(u || '').replace(/^http:\/\//, 'https://');
   P.cn = { KEYWORDS, stripTags, https,
     /* rough energy prior from the search term that found the track */
-    prior(term) { term = String(term || '').toLowerCase(); return /dnb|drum|techno|燃|energetic|dubstep|bass|electro|trance|科技/.test(term) ? 0.7 : /lofi|lo-fi|chill|ambient|downtempo|放松|氛围|低保真/.test(term) ? 0.3 : 0.5; },
+    prior(term) { term = String(term || '').toLowerCase(); return /dnb|drum|techno|燃|energetic|dubstep|bass|electro|trance|科技|trap|drill|club|炸场|派对/.test(term) ? 0.7 : /lofi|lo-fi|chill|ambient|downtempo|放松|氛围|低保真|r&b|旋律/.test(term) ? 0.3 : 0.5; },
   };
 })();

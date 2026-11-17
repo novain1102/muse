@@ -50,9 +50,10 @@ const GENRES = {
                   seeds: ['lofi beats', 'jazzhop', 'tape', 'dusty', 'chillhop', 'vinyl', 'rainy', 'mellow'] },
   'downtempo':  { label: 'Downtempo / Ambient', zh: '氛围', bpm: [80, 112],
                   seeds: ['downtempo', 'trip hop', 'organic', 'chillout', 'balearic', 'dub', 'ethereal', 'ambient'] },
-  // Chinese-language pop: popular hits wanted (hits: anti-chart scoring relaxed), dug from Chinese sources first (cn: true)
-  'cpop':       { label: '华语 C-Pop', zh: '华语流行 · R&B · 国风 · 粤语 · 说唱', bpm: [66, 132], hits: true, cn: true,
-                  seeds: ['c-pop', 'mandopop', 'chinese pop', 'cantopop', 'chinese r&b', 'guofeng', 'chinese hip hop', '华语'] },
+  // 华语: current Chinese hip-hop / trap / club music (+ some modern R&B). Popular tracks wanted (hits: anti-chart scoring
+  // relaxed), dug from Chinese sources first (cn: true), modern releases only (minYear, when the source reports a date)
+  'cpop':       { label: '华语 C-Pop', zh: '说唱 · Trap · Club · R&B', bpm: [84, 150], hits: true, cn: true, minYear: 2016,
+                  seeds: ['chinese hip hop', 'chinese trap', 'mandarin rap', 'chinese drill', 'c-rap', 'china club', 'chinese r&b', '华语说唱'] },
 };
 /* ---------- curated crate: moods ---------- */
 const MOODS = {
@@ -76,7 +77,7 @@ const PROMPT_MAP = [
   [/chill|relax|mellow|放松|休闲|轻松|安静/i, 'm', 'chill'], [/groov|funky|律动|摇摆/i, 'm', 'groovy'], [/deep|late.?night|深夜|深邃|午夜/i, 'm', 'deep'],
   [/dream|ethereal|梦|空灵/i, 'm', 'dreamy'], [/dark|暗|黑暗|阴郁/i, 'm', 'dark'], [/happy|sunny|summer|uplift|快乐|开心|阳光|夏天/i, 'm', 'happy'],
   [/energ|hard|peak|rave|party|燃|嗨|派对|激烈|蹦迪/i, 'm', 'energetic'],
-  [/华语|中文|国语|c-?pop|mandopop|cantopop|粤语|国风|古风|中国风|chinese/i, 'g', 'cpop'],
+  [/华语|中文|国语|c-?pop|c-?rap|mandopop|说唱|中文rap|chinese/i, 'g', 'cpop'],
 ];
 
 /* ---------- taste filter ---------- */
@@ -194,7 +195,7 @@ async function aiExpand(genres, moods, prompt) {
 }
 
 /* ---------- crate digging ---------- */
-const CN_PREFERRED = 'kugou';   // Chinese source used for 华语 when the picked source isn't Chinese
+const CN_PREFERRED = ['kugou', 'qqmusic'];   // Chinese sources tried for 华语 (after the picked one, if it is Chinese); Audius last
 function parsePrompt(text) {
   const g = new Set(), m = new Set(); let rest = text || '';
   for (const [re, kind, id] of PROMPT_MAP) if (re.test(rest)) { (kind === 'g' ? g : m).add(id); }
@@ -219,7 +220,7 @@ async function digCrates(args) {
   // Chinese genres (华语) want a Chinese catalogue: try the picked source if it is one (e.g. QQ in mainland China), then
   // Kugou (plays worldwide); if both come back empty, carry on with the picked source (Audius: Chinese seed terms).
   if (genres.some(g => GENRES[g].cn) && !args._cn) {
-    const tries = [prov.keywords ? prov.id : null, CN_PREFERRED].filter((x, i, a) => x && Providers.get(x) && a.indexOf(x) === i);
+    const tries = [prov.keywords ? prov.id : null, ...CN_PREFERRED].filter((x, i, a) => x && Providers.get(x) && a.indexOf(x) === i);
     let best = null;
     for (const id of tries) {
       try { const r = await digCrates({ ...args, genres, moods, source: id, _cn: true }); if (r.tracks.length >= Math.min(need, 4)) return r; if (r.tracks.length && (!best || r.tracks.length > best.tracks.length)) best = r; }
@@ -322,19 +323,26 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) 
   const full = prov.capabilities.fullTrack;
   onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
-  const qs = [], KW = prov.keywords, gOf = new Map();   // gOf: query -> app genre that asked for it
+  const qs = [], KW = prov.keywords, gOf = new Map(), byArtist = new Map();   // byArtist: artist query -> name the results must be by   // gOf: query -> app genre that asked for it
   const add = (q, g) => { q = q.trim(); if (!q || gOf.has(q)) return; gOf.set(q, g); qs.push(q); };
   if (KW && KW.genres) {   // provider vocabulary (e.g. Chinese + English terms for CN platforms)
     for (const g of genres) {
       const terms = shuffle(KW.genres[g] || [GENRES[g].label]), fl = KW.flavors && KW.flavors[g], artists = KW.artists && KW.artists[g];
-      if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
+      if (GENRES[g].hits && artists) {   // hit genres: artists' own catalogues first (mood picks, then the wider list + ~1 side-style act), a couple of scene terms last
+        const who = q => byArtist.set(q.trim(), q.replace(/ 说唱$/, '').toLowerCase());
+        if (fl) moods.forEach(m => shuffle(fl[m] || []).slice(0, 3).forEach(q => { add(q, g); who(q); }));
+        shuffle(artists).slice(0, moods.length ? 3 : 5).forEach(q => { add(q, g); who(q); });
+        const side = KW.artists2 && KW.artists2[g]; if (side) shuffle(side).slice(0, 1).forEach(q => { add(q, g); who(q); });
+        terms.slice(0, 2).forEach(q => add(q, g));
+      } else if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
       else terms.slice(0, GENRES[g].hits ? 4 : 3).forEach((t, i) => add(t + (moods[0] && i === 1 && !GENRES[g].hits && KW.moods && KW.moods[moods[0]] ? ' ' + pick(KW.moods[moods[0]]) : ''), g));
-      if (artists) shuffle(artists).slice(0, 6).forEach(q => add(q, g));   // hit genres: popular artists' catalogues
     }
   } else for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => add(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''), g)); }
   words.slice(0, 3).forEach(w => add(w, null));
   if (tx) tx.T.seedQueries(tx.TP, tx.taste, shuffle).forEach(q => add(q, null));
-  const tag = (q, list) => { const g = gOf.get(q); if (g) list.forEach(t => { if (!t.genre) t.genre = GENRES[g].label; t._g = g; }); return list; };
+  const tag = (q, list) => { const g = gOf.get(q), who = byArtist.get(q);
+    if (who) list = list.filter(t => String(t.artist || '').toLowerCase().includes(who));   // artist search: that artist's own tracks, not covers / namesakes
+    if (g) list.forEach(t => { if (!t.genre) t.genre = GENRES[g].label; t._g = g; if (!who && !t._who) t._scene = true; else { t._who = 1; t._scene = false; } }); return list; };
   let res;
   if ((prov.capabilities.searchConcurrency || 3) === 1) {   // throttling source: one search at a time, stop once the crate is deep enough
     res = []; const enough = need * (genres.some(g => GENRES[g].hits) ? 6 : 4);
@@ -344,16 +352,18 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) 
   const beatsy = genres.some(g => g === 'hiphop' || g === 'lofi' || g === 'downtempo');
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
   const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
-  const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|串烧/i;   // hit genres: originals only
+  const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
   const fanUpload = t => { const A = KW && KW.artists && KW.artists[t._g]; return /《.+》/.test(t.title) || !!(A && A.some(a => t.title.includes(a) && !(t.artist || '').includes(a))); };   // "<artist> (song)" re-uploads
-  const m = new Map(); res.forEach(t => { if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const tooOld = t => !!(t._g && GENRES[t._g].minYear && t.year && t.year < GENRES[t._g].minYear);
+  const m = new Map(); res.forEach(t => { if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
-  if (genres.some(g => GENRES[g].hits)) order = order.map(t => ({ t, s: (t._g && GENRES[t._g].hits ? Math.log10((t.plays || 0) + 1) * 0.4 : 2) + rng() * 1.5 })).sort((a, b) => b.s - a.s).map(x => x.t);   // popular first, with variety
+  if (genres.some(g => GENRES[g].hits)) order = order.map(t => ({ t, s: (t._g && GENRES[t._g].hits ? Math.log10((t.plays || 0) + 1) * 0.4 + ((t.prior ?? 0.5) - 0.5) * 1.5 - (t._scene ? 1.2 : 0) : 2) + rng() * 1.5 })).sort((a, b) => b.s - a.s).map(x => x.t);   // popular first, with variety
   if (tx) order = order.map(t => ({ t, s: tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile
   const hitsWanted = genres.some(g => GENRES[g].hits);   // hit catalogues are partly paid: try more picks
   if (lazy) {   // confirm each pick actually has a free stream before it enters the set
-    const picks = []; for (const t of order) { const c = per.get(t.artistId) || 0; if (c >= (hitsWanted ? 2 : 1)) continue; per.set(t.artistId, c + 1); picks.push(t); }   // hit genres: up to 2 per artist
+    const names = t => hitsWanted ? String(t.artist || '').toLowerCase().split(/\s*[、,&/]\s*|\s+feat\.?\s+/).filter(Boolean).concat(t.artistId) : [t.artistId];   // hit genres: features count for every artist on them
+    const picks = []; for (const t of order) { const ks = names(t); if (ks.some(k => (per.get(k) || 0) >= (hitsWanted ? 2 : 1))) continue; ks.forEach(k => per.set(k, (per.get(k) || 0) + 1)); picks.push(t); }   // hit genres: up to 2 per artist
     let i = 0, tried = 0;
     const worker = async () => { while (out.length < need && i < picks.length && tried < need * (hitsWanted ? 6 : 4)) { const t = picks[i++]; tried++;
       try { await prov.resolveStream(t); if (t.url && t.playable !== false && out.length < need) out.push(finalizeTrack(t)); } catch (e) { } } };
@@ -1009,6 +1019,7 @@ async function steer() {
     const bridges = [];
     if (old.length) { const b1 = old.slice().sort((a, b) => fit(a, anchor, midBpm) - fit(b, anchor, midBpm))[0]; bridges.push(b1); }
     const ref = bridges[0] || anchor;
+    if (bridges[0]) { const f2 = fresh.filter(t => t.id !== bridges[0].id); if (f2.length) fresh = f2; else bridges.length = 0; }   // the same track can come back from the new dig
     const b2 = fresh.slice().sort((a, b) => fit(a, ref, newMid) - fit(b, ref, newMid))[0]; bridges.push(b2);
     bridges.forEach(t => { t.pinned = true; t.bridge = true; });
     fresh = fresh.filter(t => t !== b2);

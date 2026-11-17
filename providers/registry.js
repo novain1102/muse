@@ -50,7 +50,7 @@
  *   tags       optional free-text tags, comma separated ('' if none) — used by likes / taste matching
  *   prior      0..1 energy guess before audio analysis (0.5 if unknown)
  *   url        primary stream URL (getStreamUrl)  alt  optional second URL tried if url fails
- *   plays      play count (0 if unknown)
+ *   plays      play count (0 if unknown)            year  release year or null (optional)
  *   playable   false = don't use (blocked / gated); default true
  *   listed     false = unlisted / access-restricted; skipped by the strict first pass; default true
  *   signals    taste inputs for 'scored' crates — { plays, likes, reposts, followers, bpm (as reported,

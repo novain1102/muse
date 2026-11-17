@@ -50,5 +50,5 @@ decks and mixer only ever see the normalized `Track` shape, so adding a source (
 Rules every CN provider follows: only what the platform streams for free to an anonymous listener; skip VIP /
 paid / trial-only songs; no login, cookies, region spoofing or third-party "unlock" mirrors.
 Lazy stream URLs: these providers implement `resolveStream()`; the 'simple' crate resolves picks until it has
-enough free ones (and throws if none → fallback). New optional provider hooks: `keywords` (genres, moods, plus `flavors` and `artists` per genre for 华语), `available()`, `hint`;
+enough free ones (and throws if none → fallback). New optional provider hooks: `keywords` (genres, moods, plus `flavors`, `artists` and `artists2` (side style, ~1 in 6 artist searches) per genre for 华语); tracks may carry `year` (Kugou PublishDate, QQ pubtime) for genres with `minYear`, `available()`, `hint`;
 `NEONDJ.providers.net.jsonp()` and `NEONDJ.providers.settings` are shared helpers.
