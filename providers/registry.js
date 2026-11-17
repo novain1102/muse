@@ -74,6 +74,7 @@
     crate: 'simple',        // 'scored' = rich popularity signals -> full taste filter + trending top-up;
                             // 'simple' = shuffle + one-per-artist dig with basic reject rules (preview catalogues)
     rateLimited: false,     // informational: source is known to answer HTTP 429 under bursts
+    searchConcurrency: 3,   // parallel search() calls in a 'simple' crate dig
     resolveConcurrency: 4,  // parallel resolveStream() calls while a 'simple' crate confirms picks (lower for throttling sources)
   };
 

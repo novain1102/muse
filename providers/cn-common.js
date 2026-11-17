@@ -18,6 +18,20 @@
       'hiphop':      ['instrumental hip hop', '嘻哈 伴奏', 'boom bap', 'jazz rap'],
       'lofi':        ['lofi', 'lo-fi', '低保真', 'lofi 学习', 'chillhop'],
       'downtempo':   ['downtempo', 'chillout', '氛围音乐', 'trip hop', 'ambient'],
+      'cpop':        ['华语流行', '华语 热歌', '华语金曲', '华语 经典', '华语R&B', '国风', '粤语 经典', '华语说唱', '民谣', '华语 新歌', '华语 原创', '综艺 live'],
+    },
+    // 华语 sub-flavours picked by mood (one chip, mood chips choose the flavour)
+    flavors: {
+      'cpop': {
+        'chill': ['华语 抒情', '民谣', '华语 治愈'], 'groovy': ['华语R&B', '华语 R&B 律动', '华语 放克'], 'deep': ['粤语 经典', '华语 深情', '粤语 抒情'],
+        'dreamy': ['国风', '古风', '中国风'], 'dark': ['华语说唱', '中文说唱', '华语 摇滚'], 'happy': ['华语 甜歌', '华语流行', '华语 热歌'],
+        'energetic': ['华语说唱', '华语 摇滚', '华语 热歌'],
+      },
+    },
+    // popular artists' catalogues for hit-seeking genres (search terms only; what plays is whatever the platform serves free)
+    artists: {
+      'cpop': ['周杰伦', '林俊杰', '陈奕迅', '邓紫棋', '薛之谦', '李荣浩', '毛不易', '周深', '王菲', '孙燕姿', '五月天', '蔡依林', '张学友', '汪苏泷',
+        '莫文蔚', '陶喆', '王力宏', '田馥甄', '张惠妹', '华晨宇', '许嵩', '李健', '赵雷', '朴树', '告五人', '单依纯', '张杰', '梁静茹', '方大同', '容祖儿', '杨千嬅', '刘惜君'],
     },
     moods: {
       'chill': ['chill', '放松'], 'groovy': ['groove', '律动'], 'deep': ['deep', '深夜'], 'dreamy': ['dreamy', '梦幻'],

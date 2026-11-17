@@ -50,6 +50,9 @@ const GENRES = {
                   seeds: ['lofi beats', 'jazzhop', 'tape', 'dusty', 'chillhop', 'vinyl', 'rainy', 'mellow'] },
   'downtempo':  { label: 'Downtempo / Ambient', zh: '氛围', bpm: [80, 112],
                   seeds: ['downtempo', 'trip hop', 'organic', 'chillout', 'balearic', 'dub', 'ethereal', 'ambient'] },
+  // Chinese-language pop: popular hits wanted (hits: anti-chart scoring relaxed), dug from Chinese sources first (cn: true)
+  'cpop':       { label: '华语 C-Pop', zh: '华语流行 · R&B · 国风 · 粤语 · 说唱', bpm: [66, 132], hits: true, cn: true,
+                  seeds: ['c-pop', 'mandopop', 'chinese pop', 'cantopop', 'chinese r&b', 'guofeng', 'chinese hip hop', '华语'] },
 };
 /* ---------- curated crate: moods ---------- */
 const MOODS = {
@@ -73,6 +76,7 @@ const PROMPT_MAP = [
   [/chill|relax|mellow|放松|休闲|轻松|安静/i, 'm', 'chill'], [/groov|funky|律动|摇摆/i, 'm', 'groovy'], [/deep|late.?night|深夜|深邃|午夜/i, 'm', 'deep'],
   [/dream|ethereal|梦|空灵/i, 'm', 'dreamy'], [/dark|暗|黑暗|阴郁/i, 'm', 'dark'], [/happy|sunny|summer|uplift|快乐|开心|阳光|夏天/i, 'm', 'happy'],
   [/energ|hard|peak|rave|party|燃|嗨|派对|激烈|蹦迪/i, 'm', 'energetic'],
+  [/华语|中文|国语|c-?pop|mandopop|cantopop|粤语|国风|古风|中国风|chinese/i, 'g', 'cpop'],
 ];
 
 /* ---------- taste filter ---------- */
@@ -96,17 +100,17 @@ function tasteScore(t, ctx) {
   else if (lp < 2) s -= 0.2;
   else if (lp <= 4.7) s += 1;        // ~100 .. 50k plays: the "deeper cuts" sweet spot
   else if (lp <= 5.6) s += 0.2;
-  else s -= 1.4;                     // > ~400k: viral / chart territory
+  else if (!ctx.hits) s -= 1.4;      // > ~400k: viral / chart territory (wanted for hit genres like 华语)
   const love = ((sg.likes || 0) + 1.5 * (sg.reposts || 0)) / (p + 25);
   s += clamp(love * 18, 0, 1.3);     // engagement ratio = listeners actually liked it
   const f = sg.followers || 0;
-  if (f > 400000) s -= 0.7; else if (f < 60000) s += 0.3;
+  if (f > 400000) { if (!ctx.hits) s -= 0.7; } else if (f < 60000) s += 0.3;
   let hits = 0; for (const k of ctx.seedTerms) if (blob.includes(k)) hits++;
   s += Math.min(1.6, hits * 0.4);
   if (ctx.genreSet.has(t.genre)) s += 0.8; else if (ctx.genreSet.size) s -= 0.6;
   if (ctx.moodSet.size && t.mood) s += ctx.moodSet.has(t.mood) ? 0.7 : -0.15;
   const aname = sg.artistName ?? t.artist ?? '';
-  if (MAINSTREAM.test(title) || MAINSTREAM.test(aname)) s -= 1.3;   // chart bait / pop re-rubs
+  if (!ctx.hits && (MAINSTREAM.test(title) || MAINSTREAM.test(aname))) s -= 1.3;   // chart bait / pop re-rubs
   const uname = aname.toLowerCase();
   if (ctx.genrePhrases.some(gp => uname.includes(gp)) || /music|records? ?label|beats|official/i.test(uname) && /\d{3,}/.test(uname)) s -= 0.8;   // channel-style uploaders
   if (SOFT_PENALTY.test(title) && !ctx.allowEdits) s -= 0.35;
@@ -190,6 +194,7 @@ async function aiExpand(genres, moods, prompt) {
 }
 
 /* ---------- crate digging ---------- */
+const CN_PREFERRED = 'kugou';   // Chinese source used for 华语 when the picked source isn't Chinese
 function parsePrompt(text) {
   const g = new Set(), m = new Set(); let rest = text || '';
   for (const [re, kind, id] of PROMPT_MAP) if (re.test(rest)) { (kind === 'g' ? g : m).add(id); }
@@ -199,7 +204,8 @@ function parsePrompt(text) {
   return { g: [...g], m: [...m], words: words.slice(0, 4).map(w => w.toLowerCase()) };
 }
 
-async function digCrates({ genres, moods, prompt, need, source, onStatus, taste }) {
+async function digCrates(args) {
+  let { genres, moods, prompt, need, source, onStatus, taste } = args;
   const P = parsePrompt(prompt);
   const prov = Providers.resolve(source);
   if (!prov) throw new Error('no music provider registered');
@@ -210,13 +216,24 @@ async function digCrates({ genres, moods, prompt, need, source, onStatus, taste 
   if (TP && !genres.length && !moods.length && !String(prompt || '').trim()) genres = T.genresFor(prov, TP);   // nothing picked: start from what you liked
   if (!genres.length) { const s = new Set(); moods.forEach(m => (MOOD_FALLBACK_GENRES[m] || []).slice(0, 2).forEach(g => s.add(g))); genres = s.size ? [...s] : ['deep-house']; }
   if (!moods.length && !genres.length) moods = ['groovy'];
+  // Chinese genres (华语) want a Chinese catalogue: try the picked source if it is one (e.g. QQ in mainland China), then
+  // Kugou (plays worldwide); if both come back empty, carry on with the picked source (Audius: Chinese seed terms).
+  if (genres.some(g => GENRES[g].cn) && !args._cn) {
+    const tries = [prov.keywords ? prov.id : null, CN_PREFERRED].filter((x, i, a) => x && Providers.get(x) && a.indexOf(x) === i);
+    let best = null;
+    for (const id of tries) {
+      try { const r = await digCrates({ ...args, genres, moods, source: id, _cn: true }); if (r.tracks.length >= Math.min(need, 4)) return r; if (r.tracks.length && (!best || r.tracks.length > best.tracks.length)) best = r; }
+      catch (e) { console.warn(`${Providers.get(id).name}: no Chinese tracks`, e); }
+    }
+    if (best) return best;   // a short Chinese set beats none; endless mode keeps digging
+  }
   const aiWords = await aiExpand(genres, moods, prompt);
   const srcGenres = Providers.mapGenres(prov, genres);   // provider's own genre / mood filter vocabulary
   const srcMoods = Providers.mapMoods(prov, moods);
   const moodWords = moods.flatMap(m => MOODS[m].words);
   const seedTerms = new Set([...genres.flatMap(g => GENRES[g].seeds), ...moodWords, ...P.words, ...aiWords].map(s => s.toLowerCase()));
   const bpmRanges = genres.map(g => GENRES[g].bpm); BPM_HOME = bpmRanges;
-  const ctx = { seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
+  const ctx = { hits: genres.some(g => GENRES[g].hits), seedTerms, bpmRanges, genreSet: new Set(srcGenres), moodSet: new Set(srcMoods), allowEdits: genres.includes('disco'),
     genrePhrases: [...new Set([...srcGenres, 'lofi', 'lo-fi', 'deep house', 'techno', 'house music', 'hip hop', 'drum and bass'].map(x => x.toLowerCase()))].filter(x => x.length > 3) };
   const info = { genres, moods };
 
@@ -305,25 +322,40 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) 
   const full = prov.capabilities.fullTrack;
   onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
-  const qs = [], KW = prov.keywords;
+  const qs = [], KW = prov.keywords, gOf = new Map();   // gOf: query -> app genre that asked for it
+  const add = (q, g) => { q = q.trim(); if (!q || gOf.has(q)) return; gOf.set(q, g); qs.push(q); };
   if (KW && KW.genres) {   // provider vocabulary (e.g. Chinese + English terms for CN platforms)
-    for (const g of genres) { const terms = shuffle(KW.genres[g] || [GENRES[g].label]); terms.slice(0, 3).forEach((s, i) => qs.push(s + (moods[0] && i === 1 && KW.moods && KW.moods[moods[0]] ? ' ' + pick(KW.moods[moods[0]]) : ''))); }
-  } else for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => qs.push(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''))); }
-  words.slice(0, 3).forEach(w => qs.push(w));
-  if (tx) tx.T.seedQueries(tx.TP, tx.taste, shuffle).forEach(q => qs.push(q));
-  let res = (await pool(qs, 3, q => prov.search(q))).flat().filter(Boolean);
+    for (const g of genres) {
+      const terms = shuffle(KW.genres[g] || [GENRES[g].label]), fl = KW.flavors && KW.flavors[g], artists = KW.artists && KW.artists[g];
+      if (fl && moods.length) { moods.forEach(m => shuffle(fl[m] || []).slice(0, 2).forEach(q => add(q, g))); terms.slice(0, 2).forEach(q => add(q, g)); }
+      else terms.slice(0, GENRES[g].hits ? 4 : 3).forEach((t, i) => add(t + (moods[0] && i === 1 && !GENRES[g].hits && KW.moods && KW.moods[moods[0]] ? ' ' + pick(KW.moods[moods[0]]) : ''), g));
+      if (artists) shuffle(artists).slice(0, 6).forEach(q => add(q, g));   // hit genres: popular artists' catalogues
+    }
+  } else for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => add(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''), g)); }
+  words.slice(0, 3).forEach(w => add(w, null));
+  if (tx) tx.T.seedQueries(tx.TP, tx.taste, shuffle).forEach(q => add(q, null));
+  const tag = (q, list) => { const g = gOf.get(q); if (g) list.forEach(t => { if (!t.genre) t.genre = GENRES[g].label; t._g = g; }); return list; };
+  let res;
+  if ((prov.capabilities.searchConcurrency || 3) === 1) {   // throttling source: one search at a time, stop once the crate is deep enough
+    res = []; const enough = need * (genres.some(g => GENRES[g].hits) ? 6 : 4);
+    for (const q of qs) { try { res.push(...tag(q, await prov.search(q))); } catch (e) { } if (res.filter(t => t.playable !== false).length >= enough) break; }
+  } else res = (await pool(qs, 3, q => prov.search(q).then(list => tag(q, list)))).flat().filter(Boolean);
   if (tx) res = res.concat(await digSimilar(prov, tx.likes, tx.TM, onStatus)).filter(t => !tx.TP.ids.has(tx.T.Likes.key(t)));
   const beatsy = genres.some(g => g === 'hiphop' || g === 'lofi' || g === 'downtempo');
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
   const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
-  const m = new Map(); res.forEach(t => { if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|串烧/i;   // hit genres: originals only
+  const fanUpload = t => { const A = KW && KW.artists && KW.artists[t._g]; return /《.+》/.test(t.title) || !!(A && A.some(a => t.title.includes(a) && !(t.artist || '').includes(a))); };   // "<artist> (song)" re-uploads
+  const m = new Map(); res.forEach(t => { if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
+  if (genres.some(g => GENRES[g].hits)) order = order.map(t => ({ t, s: (t._g && GENRES[t._g].hits ? Math.log10((t.plays || 0) + 1) * 0.4 : 2) + rng() * 1.5 })).sort((a, b) => b.s - a.s).map(x => x.t);   // popular first, with variety
   if (tx) order = order.map(t => ({ t, s: tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile
+  const hitsWanted = genres.some(g => GENRES[g].hits);   // hit catalogues are partly paid: try more picks
   if (lazy) {   // confirm each pick actually has a free stream before it enters the set
-    const picks = []; for (const t of order) { const c = per.get(t.artistId) || 0; if (c) continue; per.set(t.artistId, 1); picks.push(t); }
+    const picks = []; for (const t of order) { const c = per.get(t.artistId) || 0; if (c >= (hitsWanted ? 2 : 1)) continue; per.set(t.artistId, c + 1); picks.push(t); }   // hit genres: up to 2 per artist
     let i = 0, tried = 0;
-    const worker = async () => { while (out.length < need && i < picks.length && tried < need * 4) { const t = picks[i++]; tried++;
+    const worker = async () => { while (out.length < need && i < picks.length && tried < need * (hitsWanted ? 6 : 4)) { const t = picks[i++]; tried++;
       try { await prov.resolveStream(t); if (t.url && t.playable !== false && out.length < need) out.push(finalizeTrack(t)); } catch (e) { } } };
     await Promise.all(Array.from({ length: prov.capabilities.resolveConcurrency || 4 }, worker));
     if (!out.length && picks.length) throw new Error(prov.name + ': no free streams available here');
@@ -1480,6 +1512,7 @@ function draw() {
 
 /* ---- init ---- */
 function init() {
+  Providers.list().forEach(p => { if (p.keywords) for (const g in GENRES) if (!p.genreFilters[g]) p.genreFilters[g] = [GENRES[g].label]; });
   buildChips(); buildSources(); buildPads(); loadOpts(); renderList(); bindLikes();
   buildDeckShell($('#deckA'), 'A'); buildDeckShell($('#deckB'), 'B');
   if (!Providers.usable().some(p => p.id === opt('source').value)) opt('source').value = Providers.defaultId;   // stale / removed provider id

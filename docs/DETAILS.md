@@ -59,6 +59,13 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
   One track per artist still applies. If no genre/mood/prompt is picked, the set starts from your most-liked genres.
 - All scripted and deterministic. Works through the provider interface, so it carries over to new sources.
 
+## 华语 / C-Pop
+One genre chip for Chinese-language pop hits; the mood picks the flavour (chill → ballads/folk, groovy → R&B, deep → Cantonese classics,
+dreamy → 国风, dark/energetic → rap/rock, happy → pop). Hits are wanted here, so the anti-chart penalties are off for it. With a
+non-Chinese source selected, the dig goes to Kugou (QQ first if QQ is the source); originals only (no DJ edits, karaoke, covers,
+re-uploads). Kugou's paid songs (music-pack flag) are skipped before any request. If Kugou finds nothing, Audius is searched
+with Chinese terms.
+
 ## Steering a playing set (换风格不用重来)
 Change the Genre / Mood chips while a set is playing — no need to press Generate. After ~1.5 s Muse digs the
 new selection in the background ("Shifting to Tech House…"), keeps the playing track and the already-cued next
