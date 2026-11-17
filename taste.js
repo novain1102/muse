@@ -2,7 +2,8 @@
  * Provider-agnostic: works on the normalized Track (providers/registry.js), so it carries over to any source.
  * Loaded after providers/*.js and before app.js; exposes window.NEONDJ.taste.
  *
- *  Likes     localStorage 'neondj.likes' = [LikeRecord]; export / import as JSON.
+ *  Likes     localStorage 'neondj.likes' = [LikeRecord]; export / import as JSON (with dislikes).
+ *  Dislikes  localStorage 'neondj.dislikes' = [same records]; avoid() / blocked() / penalty(): never again + negative signal.
  *  profile() liked tracks -> { artists, genres, moods, tags, BPM range, Camelot keys, play-count depth }.
  *  similarity(track, profile) -> 0 … ~3.2 points: how much a candidate looks like what you liked.
  *  The app (digCrates in app.js) uses these to add search seeds, boost candidates and mix liked tracks in.
@@ -18,33 +19,85 @@
   const valid = r => r && typeof r === 'object' && typeof r.src === 'string' && r.id != null && r.id !== '' && typeof r.title === 'string';
   const norm = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
-  /* ---------- likes store ---------- */
-  let list = null; const subs = [];
-  const load = () => { if (list) return list; try { const v = JSON.parse(localStorage.getItem(KEY) || '[]'); list = Array.isArray(v) ? v.filter(valid) : []; } catch (e) { list = []; } return list; };
-  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(list)); } catch (e) { console.warn('likes not saved', e); } subs.forEach(f => { try { f(); } catch (e) { } }); };
-  const record = t => { const r = {}; FIELDS.forEach(f => { if (t[f] !== undefined && t[f] !== null && t[f] !== '') r[f] = t[f]; });
-    if (r.tags == null && t.signals && t.signals.tags) r.tags = t.signals.tags; r.id = String(r.id); r.likedAt = Date.now(); return r; };
-  const Likes = {
-    key: keyOf,
-    all() { return load(); },
-    count() { return load().length; },
-    has(t) { if (!t) return false; const k = keyOf(t); return load().some(r => keyOf(r) === k); },
-    add(t) { if (!t || Likes.has(t)) return false; load().unshift(record(t)); save(); return true; },
-    remove(t) { const k = typeof t === 'string' ? t : keyOf(t); const n = load().length; list = load().filter(r => keyOf(r) !== k); if (list.length !== n) save(); },
-    toggle(t) { if (Likes.has(t)) { Likes.remove(t); return false; } Likes.add(t); return true; },
-    onChange(f) { subs.push(f); },
-    exportData() { return { app: 'Muse', kind: 'likes', v: 1, exportedAt: new Date().toISOString(), tracks: load() }; },
-    /* merge an exported file (or a bare array); returns { added, total, skipped } */
-    importData(obj) {
-      const arr = Array.isArray(obj) ? obj : obj && Array.isArray(obj.tracks) ? obj.tracks : null;
-      if (!arr) throw new Error('not a Muse likes file');
-      const have = new Set(load().map(keyOf)); let added = 0, skipped = 0;
-      for (const r of arr) { if (!valid(r)) { skipped++; continue; } const c = {}; FIELDS.concat('likedAt').forEach(f => { if (r[f] !== undefined) c[f] = r[f]; }); c.id = String(c.id);
-        if (have.has(keyOf(c))) { skipped++; continue; } have.add(keyOf(c)); list.push(c); added++; }
-      if (added) save(); return { added, total: list.length, skipped };
-    },
-    _reload() { list = null; return load(); },
+  /* ---------- likes / dislikes stores (same record shape; a track is never in both) ---------- */
+  const DKEY = 'neondj.dislikes';
+  function makeStore(KEYN, stamp) {
+    let list = null; const subs = [];
+    const load = () => { if (list) return list; try { const v = JSON.parse(localStorage.getItem(KEYN) || '[]'); list = Array.isArray(v) ? v.filter(valid) : []; } catch (e) { list = []; } return list; };
+    const save = () => { try { localStorage.setItem(KEYN, JSON.stringify(list)); } catch (e) { console.warn(KEYN + ' not saved', e); } subs.forEach(f => { try { f(); } catch (e) { } }); };
+    const record = t => { const r = {}; FIELDS.forEach(f => { if (t[f] !== undefined && t[f] !== null && t[f] !== '') r[f] = t[f]; });
+      if (r.tags == null && t.signals && t.signals.tags) r.tags = t.signals.tags; r.id = String(r.id); r[stamp] = Date.now(); return r; };
+    const St = {
+      key: keyOf,
+      all() { return load(); },
+      count() { return load().length; },
+      has(t) { if (!t) return false; const k = keyOf(t); return load().some(r => keyOf(r) === k); },
+      add(t) { if (!t || St.has(t)) return false; St.other && St.other.remove(t); load().unshift(record(t)); save(); return true; },   // liking clears a dislike and vice versa
+      remove(t) { const k = typeof t === 'string' ? t : keyOf(t); const n = load().length; list = load().filter(r => keyOf(r) !== k); if (list.length !== n) save(); },
+      toggle(t) { if (St.has(t)) { St.remove(t); return false; } St.add(t); return true; },
+      onChange(f) { subs.push(f); },
+      /* merge records (array); returns { added, skipped } */
+      merge(arr, isBlocked) {
+        const have = new Set(load().map(keyOf)); let added = 0, skipped = 0;
+        for (const r of arr) { if (!valid(r)) { skipped++; continue; } const c = {}; FIELDS.concat(stamp).forEach(f => { if (r[f] !== undefined) c[f] = r[f]; }); c.id = String(c.id);
+          if (have.has(keyOf(c)) || (isBlocked && isBlocked(c))) { skipped++; continue; } have.add(keyOf(c)); list.push(c); added++; }
+        if (added) save(); return { added, skipped };
+      },
+      _reload() { list = null; return load(); },
+    };
+    return St;
+  }
+  const Likes = makeStore(KEY, 'likedAt'), Dislikes = makeStore(DKEY, 'dislikedAt');
+  Likes.other = Dislikes; Dislikes.other = Likes;
+  /* export: { likes as before, + dislikes } — older files without `dislikes` still import */
+  Likes.exportData = () => ({ app: 'Muse', kind: 'likes', v: 1, exportedAt: new Date().toISOString(), tracks: Likes.all(), dislikes: Dislikes.all() });
+  /* merge an exported file (or a bare array of likes); returns { added, total, skipped, disliked } */
+  Likes.importData = obj => {
+    const arr = Array.isArray(obj) ? obj : obj && Array.isArray(obj.tracks) ? obj.tracks : null;
+    if (!arr) throw new Error('not a Muse likes file');
+    const r = Likes.merge(arr, c => Dislikes.has(c));                         // your existing dislikes win over imported likes
+    const d = obj && Array.isArray(obj.dislikes) ? Dislikes.merge(obj.dislikes, c => Likes.has(c)) : { added: 0, skipped: 0 };
+    return { added: r.added, total: Likes.count(), skipped: r.skipped + d.skipped, disliked: d.added };
   };
+
+  /* ---------- dislikes as a negative signal ----------
+   * hard (always): a disliked track never comes back (same id, or same title + artist on another upload); an artist with 2+
+   * dislikes is excluded.  soft = negative taste profile, scaled by the Taste setting in app.js (Off 0 · Some · Strong): same artist −1,
+   * shared disliked tags ≤ −0.6, genre ≤ −0.4 / mood ≤ −0.2 / tempo band −0.2 (only where dislikes outweigh likes). */
+  const splitArtists = s => String(s || '').split(/\s*(?:[、，,;；]|\s(?:feat\.?|ft\.?|with)\s)\s*/i).map(norm).filter(a => a && a !== 'unknown' && a !== 'various artists');
+  const songKey = t => norm(t.title).replace(/\s+/g, '') + '|' + norm(t.artist).replace(/\s+/g, '');
+  function avoid(dis) {
+    dis = dis || Dislikes.all(); if (!dis.length) return null;
+    const A = { n: dis.length, ids: new Set(dis.map(keyOf)), songs: new Set(dis.map(songKey)), artists: new Map(), artistIds: new Map(), tags: new Map(), banned: new Set(), bannedIds: new Set(), topTags: [] };
+    for (const t of dis) {
+      new Set(splitArtists(t.artist)).forEach(a => bump(A.artists, a));
+      if (t.artistId != null && t.artistId !== '') bump(A.artistIds, t.src + ':' + t.artistId);
+      new Set(tagList(t.tags)).forEach(x => bump(A.tags, x));
+    }
+    A.artists.forEach((c, a) => { A.tags.delete(a); if (c >= 2) A.banned.add(a); });
+    A.artistIds.forEach((c, k) => { if (c >= 2) A.bannedIds.add(k); });
+    const liked = profile(Likes.all());                                         // styles you also like aren't held against a track
+    A.topTags = [...A.tags.entries()].filter(x => !(liked && liked.tags.has(x[0]))).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 10).map(x => x[0]);
+    const NP = profile(dis); A.genres = NP.genres; A.moods = NP.moods; A.bpm = NP.bpm;     // negative taste profile (same features likes use)
+    A.likedBpm = liked && liked.bpm; A.likedGenres = liked ? liked.genres : new Map(); A.likedMoods = liked ? liked.moods : new Map();
+    return A;
+  }
+  function blocked(t, A) {
+    if (!A || !t) return false;
+    return A.ids.has(keyOf(t)) || A.songs.has(songKey(t)) || A.bannedIds.has(t.src + ':' + t.artistId) || splitArtists(t.artist).some(a => A.banned.has(a));
+  }
+  function penalty(t, A) {
+    if (!A || !t) return 0;
+    let s = splitArtists(t.artist).some(a => A.artists.has(a)) || (t.artistId != null && A.artistIds.has(t.src + ':' + t.artistId)) ? 1 : 0;
+    if (A.topTags.length) { const own = new Set(tagList(t.tags != null ? t.tags : t.signals && t.signals.tags)); let h = 0; for (const x of A.topTags) if (own.has(x)) h++; s += Math.min(0.6, h * 0.2); }
+    // genre / mood / tempo features: only the part your dislikes outweigh your likes for
+    const g = String(t.genre || '').toLowerCase(), net = (M, L, k) => Math.max(0, (M.get(k) || 0) / A.n - (L.get(k) || 0) / Math.max(1, Likes.count()));
+    if (g && A.genres.has(g)) s += 0.4 * Math.min(1, 2 * net(A.genres, A.likedGenres, g));
+    const m = String(t.mood || '').toLowerCase(); if (m && A.moods.has(m)) s += 0.2 * Math.min(1, 2 * net(A.moods, A.likedMoods, m));
+    const inB = (B, b) => B && b && [b, b * 2, b / 2].some(x => x >= B.lo && x <= B.hi);
+    if (A.n >= 3 && inB(A.bpm, t.bpm) && !inB(A.likedBpm, t.bpm)) s += 0.2;
+    return s;
+  }
 
   /* ---------- taste profile ---------- */
   const TAG_STOP = new Set(['music', 'new', 'remix', 'original', 'original mix', 'mix', 'edit', 'free', 'free download', 'beat', 'beats', 'song', 'track', 'audius', 'dj', 'producer', 'electronic', 'official', 'single']);
@@ -114,5 +167,5 @@
     return sc.sort((a, b) => b[1] - a[1]).slice(0, 2).map(x => x[0]);
   }
 
-  NS.taste = { Likes, profile, similarity, seedQueries, genresFor, mode, MODES, KEY, FIELDS, tagList };
+  NS.taste = { Likes, Dislikes, avoid, blocked, penalty, DKEY, profile, similarity, seedQueries, genresFor, mode, MODES, KEY, FIELDS, tagList };
 })();

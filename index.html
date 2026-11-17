@@ -103,7 +103,10 @@
           <div class="progress"><div id="nowBar"></div></div>
           <div class="times"><span id="nowTime">0:00</span><span id="nowInfo"></span><span id="nowLeft">0:00</span></div>
         </div>
+        <div class="npacts">
+          <button id="dislikeNow" class="dis big" type="button" disabled title="Play something first" aria-pressed="false"></button>
         <button id="likeNow" class="heart big" type="button" disabled title="Play something to like it" aria-pressed="false">♡</button>
+        </div>
       </div>
       <div id="xfadeBadge" class="xbadge">MIXING</div>
       <div id="fxlog" class="fxlog"></div>
@@ -153,7 +156,7 @@
   <!-- RIGHT: tracklist -->
   <section class="panel glass list" id="listPanel">
     <div class="lhead"><h2>Tracklist</h2><span id="listInfo" class="muted"></span></div>
-    <div class="seg tabs"><button id="tabSet" class="on" type="button">Set</button><button id="tabLiked" type="button">♥ Liked <b id="likedCount">0</b></button></div>
+    <div class="seg tabs"><button id="tabSet" class="on" type="button">Set</button><button id="tabLiked" type="button">♥ Liked <b id="likedCount">0</b></button><button id="tabDisliked" class="tabdis" type="button" title="Disliked tracks — never picked again"><i class="dico"></i> <b id="dislikedCount">0</b></button></div>
     <div class="setview">
       <div class="upnext"><span class="tag">Up next</span><span id="upNext">—</span></div>
       <ol id="tracklist" class="tracks"></ol>
@@ -161,10 +164,11 @@
     <div class="likedview">
       <div class="likebar">
         <span id="tasteSummary" class="muted" title="Your taste profile"></span>
-        <span class="likeacts"><button id="likesExport" class="btn mini" type="button" title="Download likes as JSON">Export</button><button id="likesImport" class="btn mini" type="button" title="Merge likes from a JSON file">Import</button></span>
+        <span class="likeacts"><button id="likesExport" class="btn mini" type="button" title="Download likes + dislikes as JSON">Export</button><button id="likesImport" class="btn mini" type="button" title="Merge likes + dislikes from a JSON file">Import</button></span>
         <input id="likesFile" type="file" accept="application/json,.json" hidden />
       </div>
       <ol id="likedList" class="tracks liked"></ol>
+      <ol id="dislikedList" class="tracks liked disliked"></ol>
     </div>
     <div class="master" title="Master volume">
       <span class="olbl">Master</span>

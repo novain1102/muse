@@ -213,6 +213,8 @@ async function digCrates(args) {
   // taste (♥ likes, taste.js): TP stays null with zero likes or taste Off -> exactly the plain dig below
   const T = NEONDJ.taste, TM = T.mode(taste), likes = TM.w ? T.Likes.all() : [];
   const TP = likes.length ? T.profile(likes) : null;
+  // dislikes: hard exclusion always; the soft down-rank follows the Taste setting (Off = none). AV stays null without dislikes
+  const AV = T.avoid(), avW = 0.9 * TM.w;
   genres = [...new Set([...genres, ...P.g])]; moods = [...new Set([...moods, ...P.m])];
   if (TP && !genres.length && !moods.length && !String(prompt || '').trim()) genres = T.genresFor(prov, TP);   // nothing picked: start from what you liked
   if (!genres.length) { const s = new Set(); moods.forEach(m => (MOOD_FALLBACK_GENRES[m] || []).slice(0, 2).forEach(g => s.add(g))); genres = s.size ? [...s] : ['deep-house']; }
@@ -240,7 +242,7 @@ async function digCrates(args) {
 
   const tx = TP ? { T, TP, TM, likes, taste } : null;
   if (prov.capabilities.crate !== 'scored') {
-    let tracks = await digSimple(prov, genres, moods, P.words.concat(aiWords), need, onStatus, tx);
+    let tracks = await digSimple(prov, genres, moods, P.words.concat(aiWords), need, onStatus, tx, AV && { T, A: AV, w: avW });
     if (TP) tracks = mixInLikes(tracks, likes, prov, TM, need, ctx);
     return { tracks, info, source: prov.id, liked: tracks.filter(t => t.fromLikes).length };
   }
@@ -266,8 +268,8 @@ async function digCrates(args) {
   const uniq = () => { const m = new Map(); raw.forEach(t => { if (t && t.id && !m.has(t.id)) m.set(t.id, t); }); return [...m.values()]; };
   let cands = uniq().filter(t => t.playable !== false && t.listed !== false);
   // score = anti-chart taste filter + (with likes) weighted similarity to the ♥ profile; liked tracks themselves only come back via mixInLikes
-  const scoreAll = list => (TP ? list.filter(t => !TP.ids.has(T.Likes.key(t))) : list)
-    .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); return { t, s }; }).filter(x => x.s > -50);
+  const scoreAll = list => (TP ? list.filter(t => !TP.ids.has(T.Likes.key(t))) : list).filter(t => !AV || !T.blocked(t, AV))
+    .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); if (AV && avW && s > -50) s -= avW * T.penalty(t, AV); return { t, s }; }).filter(x => x.s > -50);
   let scored = scoreAll(cands);
   if (scored.length < need * 2) {          // widen: open searches without filters
     onStatus('Finding more tracks…');
@@ -319,7 +321,7 @@ function mixInLikes(tracks, likes, prov, TM, need, ctx) {
 }
 
 /* 'simple' crate for providers without popularity signals (e.g. preview catalogues): basic reject rules, shuffle, one per artist */
-async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) {
+async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, av = null) {
   const full = prov.capabilities.fullTrack;
   onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
@@ -355,11 +357,12 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) 
   const NOT_ORIGINAL = /\bdj\b|dj版|remix|伴奏|纯音乐|钢琴版|八音盒|合唱版|群星|铃声|片段|抖音|翻唱|翻自|\bcover\b|加速|降调|0\.\d+x|\b(slowed|sped)\b|女版|男版|live版|串烧|中文版|填词|女生版|男生版|\((drill|trap|phonk)\)/i;   // hit genres: originals only
   const fanUpload = t => { const A = KW && KW.artists && KW.artists[t._g]; return /《.+》/.test(t.title) || !!(A && A.some(a => t.title.includes(a) && !(t.artist || '').includes(a))); };   // "<artist> (song)" re-uploads
   const tooOld = t => !!(t._g && GENRES[t._g].minYear && t.year && t.year < GENRES[t._g].minYear);
-  const m = new Map(); res.forEach(t => { if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const m = new Map(); res.forEach(t => { if (av && av.T.blocked(t, av.A)) return; if (t._g && GENRES[t._g].hits && (NOT_ORIGINAL.test(t.title + ' ' + (t.artist || '')) || fanUpload(t) || tooOld(t))) return; if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
   if (genres.some(g => GENRES[g].hits)) order = order.map(t => ({ t, s: (t._g && GENRES[t._g].hits ? Math.log10((t.plays || 0) + 1) * 0.4 + ((t.prior ?? 0.5) - 0.5) * 1.5 - (t._scene ? 1.2 : 0) : 2) + rng() * 1.5 })).sort((a, b) => b.s - a.s).map(x => x.t);   // popular first, with variety
   if (tx) order = order.map(t => ({ t, s: tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile
+  if (av && av.w) order = order.map((t, k) => ({ t, s: -k * 0.05 - av.w * av.T.penalty(t, av.A) })).sort((a, b) => b.s - a.s).map(x => x.t);   // ✕ dislikes: similar artists / tags further down
   const hitsWanted = genres.some(g => GENRES[g].hits);   // hit catalogues are partly paid: try more picks
   if (lazy) {   // confirm each pick actually has a free stream before it enters the set
     const names = t => hitsWanted ? String(t.artist || '').toLowerCase().split(/\s*[、,&/]\s*|\s+feat\.?\s+/).filter(Boolean).concat(t.artistId) : [t.artistId];   // hit genres: features count for every artist on them
@@ -1129,6 +1132,7 @@ function renderFx(now) {
   }
 }
 const EMPTY_SET = '<li class="empty"><span class="ei">♪</span><b>No set yet</b><span>Pick a genre, then Generate &amp; Play</span></li>';
+const EMPTY_DISLIKES = '<li class="empty"><span class="ei"><i class="dico"></i></span><b>No dislikes</b><span>Disliked tracks are never picked again</span></li>';
 const EMPTY_LIKES = '<li class="empty"><span class="ei">♡</span><b>No likes yet</b><span>Tap ♡ on a track you love</span></li>';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
@@ -1204,7 +1208,7 @@ function renderList() {
     return `<li class="${cls}" data-i="${i}" title="${esc(t.title)} — ${esc(t.artist)}${t.genre ? ' · ' + esc(t.genre) : ''}${t.mood ? ' · ' + esc(t.mood) : ''}">
       <span class="n">${i + 1}</span><img loading="lazy" src="${esc(t.artSmall)}" alt="" data-i="${i}" onerror="artFallback(this)">
       <span class="t"><b>${t.bridge && i > S.idx ? '<em class="btag">BRIDGE</em>' : ''}${esc(t.title)}</b><span>${esc(t.artist)}${t.genre ? ' · ' + esc(t.genre) : ''}</span></span>
-      <span class="bpm"><b>${bpm}</b> bpm<br>${t.cam ? t.cam.s : ''}<i class="ebar"><i style="width:${e}%"></i></i></span>${heartBtn(t, i)}</li>`;
+      <span class="bpm"><b>${bpm}</b> bpm<br>${t.cam ? t.cam.s : ''}<i class="ebar"><i style="width:${e}%"></i></i></span>${disBtn(t, i)}${heartBtn(t, i)}</li>`;
   }).join('');
   updateListInfo(); renderUpNext();
 }
@@ -1217,6 +1221,47 @@ function renderUpNext() { const i = nextIdx(S.idx + 1); $('#upNext').textContent
 /* ---------- ♥ likes UI (store + taste logic in taste.js) ---------- */
 const Likes = NEONDJ.taste.Likes;
 const heartBtn = (t, i) => { const on = Likes.has(t); return `<button class="heart${on ? ' on' : ''}" data-like="${i}" title="${on ? 'Unlike' : 'Like'}" aria-pressed="${on}">${on ? '♥' : '♡'}</button>`; };
+/* ---------- ✕ dislikes: skip / drop from the queue, never picked again, negative taste signal (taste.js) ---------- */
+const Dislikes = NEONDJ.taste.Dislikes;
+const ICON_DOWN = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg>';
+const ICON_UNDO = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/></svg>';
+const disBtn = (t, i) => { const on = Dislikes.has(t), q = i > S.idx; return `<button class="dis${on ? ' on' : ''}" data-dislike="${i}" title="${on ? 'Undo dislike' : q ? 'Dislike — remove from the set' : 'Dislike'}" aria-pressed="${on}">${ICON_DOWN}</button>`; };
+/* is this track the one being mixed in right now (can't be pulled from under the crossfade) */
+const isIncoming = t => S.inTrans && S.live && other(S.live).track === t;
+function dislikeTrack(t, el) {
+  if (!t) return;
+  if (Dislikes.has(t)) { Dislikes.remove(t); showFx('DISLIKE UNDONE', ctx ? ctx.currentTime : 0); return; }
+  Dislikes.add(t);
+  if (el) { el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop'); }
+  const nowPlaying = S.live && S.live.track === t && !S.inTrans;
+  // drop it (and anything else now excluded, e.g. a 2nd strike on an artist) from the upcoming queue
+  const A = NEONDJ.taste.avoid(), o = S.live ? other(S.live) : null;
+  let cuedGone = false;
+  for (let j = S.set.length - 1; j > S.idx; j--) { const u = S.set[j]; if (u === t || NEONDJ.taste.blocked(u, A)) { if (isIncoming(u)) continue; if (o && o.track === u) cuedGone = true; S.set.splice(j, 1); } }
+  if (!S.live && S.idx >= 0 && S.set[S.idx] === t) { S.set.splice(S.idx, 1); S.idx--; }
+  if (cuedGone && o) { o.ready = false; o.track = null; S.preloading = null; renderDecks(); }
+  renderList();
+  if (nowPlaying && S.playing) { showFx('✕ DISLIKED · NEXT', ctx.currentTime, false, 1.2, null, 'ride'); transition('quick'); }   // quick DJ-style mix out
+  else { showFx('✕ DISLIKED', ctx ? ctx.currentTime : 0); if (S.live) { computeTransAt(); preloadNext(); } }
+  if (S.live && typeof maybeExtend === 'function') maybeExtend();
+}
+function renderDislikeNow() {
+  const t = S.live && S.live.track, b = $('#dislikeNow'); if (!b) return;
+  if (!b.firstChild) b.innerHTML = ICON_DOWN;
+  const on = !!t && Dislikes.has(t); b.disabled = !t; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on);
+  b.title = t ? (on ? 'Undo dislike (X)' : 'Dislike — skip to the next track (X)') : 'Play something first';
+}
+function renderDislikes() {
+  $('#dislikedCount').textContent = Dislikes.count();
+  const ol = $('#dislikedList'); if (!ol) return;
+  const all = Dislikes.all();
+  ol.innerHTML = all.length ? all.map((t, i) => `<li data-k="${esc(Dislikes.key(t))}" title="${esc(t.title)} — ${esc(t.artist)}">
+      <span class="n">${i + 1}</span><img loading="lazy" src="${esc(t.artSmall || t.art || '')}" alt="" onerror="this.style.visibility='hidden'">
+      <span class="t"><b>${esc(t.title)}</b><span>${esc(t.artist)}${t.genre ? ' · ' + esc(t.genre) : ''}${t.src ? ' · ' + esc((Providers.get(t.src) || { name: t.src }).name) : ''}</span></span>
+      <span class="bpm">${t.bpm ? `<b>${Math.round(t.bpm)}</b> bpm` : ''}</span>
+      <button class="dis undo" data-undislike="${esc(Dislikes.key(t))}" title="Undo dislike">${ICON_UNDO}</button></li>`).join('')
+    : EMPTY_DISLIKES;
+}
 function toggleLike(t, el) {
   if (!t) return; const on = Likes.toggle(t);
   if (el) { el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop'); }
@@ -1241,22 +1286,27 @@ function renderLikes() {
   $('#tasteSummary').textContent = P ? [P.genres.size ? [...P.genres.entries()].filter(x => x[0]).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]).join(' / ') : '',
     P.bpm ? `${Math.round(P.bpm.lo + 4)}–${Math.round(P.bpm.hi - 4)} BPM` : '', P.topTags.slice(0, 4).join(', ')].filter(Boolean).join(' · ') : '';
 }
-function showLiked(on) {
-  $('#listPanel').classList.toggle('show-liked', on); $('#tabSet').classList.toggle('on', !on); $('#tabLiked').classList.toggle('on', on);
-  if (on) renderLikes();
+function showLiked(on, dis = false) {
+  $('#listPanel').classList.toggle('show-liked', on); $('#listPanel').classList.toggle('show-disliked', on && dis);
+  $('#tabSet').classList.toggle('on', !on); $('#tabLiked').classList.toggle('on', on && !dis); $('#tabDisliked').classList.toggle('on', on && dis);
+  if (on) { renderLikes(); renderDislikes(); }
 }
 function exportLikes() {
   const blob = new Blob([JSON.stringify(Likes.exportData(), null, 1)], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `muse-likes-${new Date().toISOString().slice(0, 10)}.json`;
   document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-  setStatus(`Exported ${Likes.count()} likes`, 'ok');
+  setStatus(`Exported ${Likes.count()} likes${Dislikes.count() ? ' + ' + Dislikes.count() + ' dislikes' : ''}`, 'ok');
 }
 async function importLikes(file) {
-  try { const r = Likes.importData(JSON.parse(await file.text())); setStatus(`Imported ${r.added} likes (${r.total} total${r.skipped ? ', ' + r.skipped + ' skipped' : ''})`, 'ok'); }
+  try { const r = Likes.importData(JSON.parse(await file.text())); setStatus(`Imported ${r.added} likes${r.disliked ? ' + ' + r.disliked + ' dislikes' : ''} (${r.total} total${r.skipped ? ', ' + r.skipped + ' skipped' : ''})`, 'ok'); }
   catch (e) { setStatus('Import failed: ' + (e.message || e), 'err'); }
 }
 function bindLikes() {
-  Likes.onChange(() => { renderLikes(); renderLikeNow(); renderList(); });
+  Likes.onChange(() => { renderLikes(); renderLikeNow(); renderDislikeNow(); renderList(); });
+  Dislikes.onChange(() => { renderDislikes(); renderLikes(); renderDislikeNow(); renderLikeNow(); renderList(); });
+  $('#dislikeNow').addEventListener('click', e => dislikeTrack(S.live && S.live.track, e.currentTarget));
+  $('#tabDisliked').addEventListener('click', () => showLiked(true, true));
+  $('#dislikedList').addEventListener('click', e => { const b = e.target.closest('[data-undislike]'); if (b) Dislikes.remove(b.dataset.undislike); });
   $('#likeNow').addEventListener('click', e => toggleLike(S.live && S.live.track, e.currentTarget));
   $('#tabSet').addEventListener('click', () => showLiked(false));
   $('#tabLiked').addEventListener('click', () => showLiked(true));
@@ -1265,15 +1315,15 @@ function bindLikes() {
   $('#likesExport').addEventListener('click', exportLikes);
   $('#likesImport').addEventListener('click', () => $('#likesFile').click());
   $('#likesFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) importLikes(f); e.target.value = ''; });
-  window.addEventListener('storage', e => { if (e.key === NEONDJ.taste.KEY) { Likes._reload(); renderLikes(); renderLikeNow(); renderList(); } });   // other tabs
-  renderLikes(); renderLikeNow();
+  window.addEventListener('storage', e => { if (e.key === NEONDJ.taste.KEY || e.key === NEONDJ.taste.DKEY) { Likes._reload(); Dislikes._reload(); renderLikes(); renderDislikes(); renderLikeNow(); renderDislikeNow(); renderList(); } });   // other tabs
+  renderLikes(); renderDislikes(); renderLikeNow(); renderDislikeNow();
 }
 function renderNow() {
   const d = S.live, t = d && d.track;
   $('#nowTitle').textContent = t ? t.title : (S.set.length ? 'Ready' : 'Pick a vibe and hit Generate');
   $('#nowArtist').textContent = t ? t.artist + (t.genre ? ' · ' + t.genre : '') : '—';
   const img = $('#nowArt'); if (t && t.art) { if (img.dataset.src !== t.art) { img.dataset.src = t.art; img._k = 0; img.src = t.art; img.onerror = () => { const m = t.artMirrors || []; if (img._k < m.length) { const u = new URL(t.art); img.src = m[img._k++] + u.pathname; } }; } } else { img.removeAttribute('src'); img.dataset.src = ''; }
-  renderLikeNow();
+  renderLikeNow(); renderDislikeNow();
   $('#nowInfo').textContent = t ? [t.bpm ? Math.round(t.bpm * (d.el.playbackRate || 1)) + ' BPM' : '', t.cam ? t.cam.s : '', t.preview ? Providers.caps(t).previewSeconds + 's preview' : ''].filter(Boolean).join(' · ') : '';
 }
 function renderDecks() { S.decks.forEach(d => { d.ui.classList.toggle('live', d === S.live); $('.deckTrack', d.ui).textContent = d.track ? `${d.track.title} — ${d.track.artist}` : 'empty'; }); }
@@ -1456,6 +1506,7 @@ function buildPads() {
   window.addEventListener('keydown', e => {
     if (e.target.matches('input[type=text],input[type=password],select,textarea')) return;
     if (e.code === 'Space') { e.preventDefault(); togglePlay(); return; }
+    if (e.key === 'x' || e.key === 'X') { if (!e.repeat && S.live) dislikeTrack(S.live.track, $('#dislikeNow')); return; }
     if (e.key === 'l' || e.key === 'L') { if (!e.repeat && S.live) toggleLike(S.live.track, $('#likeNow')); return; }
     const p = keyMap[e.key.toLowerCase()]; if (!p || down.has(p.id)) return; down.add(p.id);
     $(`.pad[data-id=${p.id}]`).classList.add('on'); padDown(p.id);
@@ -1537,6 +1588,7 @@ function init() {
   $('#order').addEventListener('change', () => { resequenceUpcoming(); });
   $('#masterVol').addEventListener('input', e => { if (ctx) Master.out.gain.setTargetAtTime(+e.target.value, ctx.currentTime, 0.03); });
   $('#tracklist').addEventListener('click', e => {
+    const db = e.target.closest('[data-dislike]'); if (db) { e.stopPropagation(); dislikeTrack(S.set[+db.dataset.dislike], db); return; }
     const hb = e.target.closest('[data-like]'); if (hb) { e.stopPropagation(); toggleLike(S.set[+hb.dataset.like], hb); return; }
     const li = e.target.closest('li[data-i]'); if (!li) return; const i = +li.dataset.i; const t = S.set[i]; if (!t || i === S.idx) return;
     t.bad = false;

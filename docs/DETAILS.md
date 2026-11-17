@@ -57,6 +57,15 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
      ×0.55 for Some, ×1.1 for Strong;
   4. a few liked tracks that fit the current genres/tempo are mixed back in (Some ≈10 % max 2, Strong ≈25 % max 5).
   One track per artist still applies. If no genre/mood/prompt is picked, the set starts from your most-liked genres.
+- **Dislike** (thumbs-down next to the heart, or **X**): on the playing track it quick-mixes to the next one; on a queued
+  row it drops that track from the set; on a played row it just records it. Dislikes live in `localStorage['neondj.dislikes']`
+  (same record shape as likes) and are listed in the thumbs-down tab, where each can be undone. Liking a disliked track clears
+  the dislike and vice versa. Export / Import carry both (`dislikes` array in the same JSON; older files still import).
+  - hard, always on: a disliked track is never picked again (same id, or same title + artist on another upload), and an
+    artist with 2 dislikes is excluded — queued tracks by them leave the set at once;
+  - soft, scaled by Taste (Off none, Some ×0.5, Strong ×1): a negative taste profile takes points off candidates —
+    same artist −1, shared disliked tags ≤ −0.6, genre ≤ −0.4 / mood ≤ −0.2 / tempo band −0.2 (only where dislikes
+    outweigh likes; tags you also like aren't counted).
 - All scripted and deterministic. Works through the provider interface, so it carries over to new sources.
 
 ## 华语 / C-Pop
@@ -112,7 +121,7 @@ keeps digging the latest selection.
 
 ## Storage
 Settings and likes keep their original keys (`neondj.opts`, `neondj.sel`, `neondj.likes`, …) so nothing is
-lost after the rename (new: `neondj.tour`, `neondj.provsettings`); likes export as `muse-likes-YYYY-MM-DD.json` (older exports import fine).
+lost after the rename (new: `neondj.tour`, `neondj.provsettings`, `neondj.dislikes`); likes export as `muse-likes-YYYY-MM-DD.json` (older exports import fine).
 
 ## Honest limits
 - Music = whatever independent artists uploaded to Audius; quality varies and the catalogue is not the
