@@ -227,7 +227,7 @@ async function digCrates({ genres, moods, prompt, need, source, onStatus, taste 
     return { tracks, info, source: prov.id, liked: tracks.filter(t => t.fromLikes).length };
   }
 
-  onStatus(`Connecting to ${prov.name}… 连接音源`);
+  onStatus(`Connecting to ${prov.name}…`);
   if (prov.init) await prov.init();
   // build query plan: seed terms per genre (x mood words), mood-filtered + open variants
   const plan = [];
@@ -241,7 +241,7 @@ async function digCrates({ genres, moods, prompt, need, source, onStatus, taste 
   }
   for (const w of [...P.words, ...aiWords].slice(0, 4)) plan.push({ q: w, genres: srcGenres, moods: [] });
   if (TP) for (const q of T.seedQueries(TP, taste, shuffle)) plan.push({ q, genres: [], moods: [] });   // liked artists + tags, unfiltered
-  onStatus(`Digging crates · ${plan.length} searches… 正在挖掘唱片`);
+  onStatus('Finding tracks…');
   const res = await pool(plan, 3, p => prov.search(p.q, { genres: p.genres, moods: p.moods }));
   let raw = res.flat().filter(Boolean);
   if (TP) raw = raw.concat(await digSimilar(prov, likes, TM, onStatus));
@@ -252,13 +252,13 @@ async function digCrates({ genres, moods, prompt, need, source, onStatus, taste 
     .map(t => { let s = tasteScore(t, ctx); if (TP && s > -50) s += TM.w * T.similarity(t, TP); return { t, s }; }).filter(x => x.s > -50);
   let scored = scoreAll(cands);
   if (scored.length < need * 2) {          // widen: open searches without filters
-    onStatus('Widening the dig… 扩大搜索');
+    onStatus('Finding more tracks…');
     const extra = await pool(genres.slice(0, 3).flatMap(g => [GENRES[g].label, pick(GENRES[g].seeds) + ' ' + (moodWords[0] || '')]), 3, q => prov.search(q.trim(), {}));
     raw = raw.concat(extra.flat().filter(Boolean)); cands = uniq().filter(t => t.playable !== false);
     scored = scoreAll(cands);
   }
   if (scored.length < need && prov.trending) {   // minor fallback only
-    onStatus('Topping up from trending (fallback)… 补充');
+    onStatus('Finding more tracks…');
     const tr = await pool(srcGenres.slice(0, 3), 3, g => prov.trending(g));
     raw = raw.concat(tr.flat().filter(Boolean)); cands = uniq().filter(t => t.playable !== false);
     scored = scoreAll(cands);
@@ -278,7 +278,7 @@ async function digSimilar(prov, likes, TM, onStatus) {
   if (typeof prov.similar !== 'function' || !TM.similar) return [];
   const from = shuffle(likes.filter(l => l.src === prov.id)).slice(0, TM.similar);
   if (!from.length) return [];
-  onStatus('Digging tracks like your ♥… 按你的口味找歌');
+  onStatus('Finding tracks like your ♥…');
   const res = await pool(from, 2, l => prov.similar(l, { limit: 24 }));
   return res.flat().filter(Boolean).map(t => (t.viaSimilar = true, t));
 }
@@ -303,19 +303,32 @@ function mixInLikes(tracks, likes, prov, TM, need, ctx) {
 /* 'simple' crate for providers without popularity signals (e.g. preview catalogues): basic reject rules, shuffle, one per artist */
 async function digSimple(prov, genres, moods, words, need, onStatus, tx = null) {
   const full = prov.capabilities.fullTrack;
-  onStatus(full ? `Searching ${prov.name}… 搜索 ${prov.name}` : `Searching ${prov.name} previews… 搜索 ${prov.name} 试听`);
+  onStatus(`Searching ${prov.name}…`);
   if (prov.init) await prov.init();
-  const qs = []; for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => qs.push(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''))); }
+  const qs = [], KW = prov.keywords;
+  if (KW && KW.genres) {   // provider vocabulary (e.g. Chinese + English terms for CN platforms)
+    for (const g of genres) { const terms = shuffle(KW.genres[g] || [GENRES[g].label]); terms.slice(0, 3).forEach((s, i) => qs.push(s + (moods[0] && i === 1 && KW.moods && KW.moods[moods[0]] ? ' ' + pick(KW.moods[moods[0]]) : ''))); }
+  } else for (const g of genres) { const G = GENRES[g]; shuffle(G.seeds).slice(0, 3).forEach(s => qs.push(s + (moods[0] ? ' ' + pick(MOODS[moods[0]].words) : ''))); }
   words.slice(0, 3).forEach(w => qs.push(w));
   if (tx) tx.T.seedQueries(tx.TP, tx.taste, shuffle).forEach(q => qs.push(q));
   let res = (await pool(qs, 3, q => prov.search(q))).flat().filter(Boolean);
   if (tx) res = res.concat(await digSimilar(prov, tx.likes, tx.TM, onStatus)).filter(t => !tx.TP.ids.has(tx.T.Likes.key(t)));
   const beatsy = genres.some(g => g === 'hiphop' || g === 'lofi' || g === 'downtempo');
   const offGenre = /^(rock|pop|soundtrack|country|singer\/songwriter|alternative|christian.*|children.*|holiday|vocal|classical|latino|k-pop|j-pop|metal|easy listening)$/i;
-  const m = new Map(); res.forEach(t => { if (t.playable !== false && t.url && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
+  const lazy = typeof prov.resolveStream === 'function';   // stream URL fetched per track (signed / expiring / maybe not free)
+  const m = new Map(); res.forEach(t => { if (t.playable !== false && (t.url || lazy) && (t.fullDur ?? t.dur ?? 0) > 120 && !m.has(t.id) && !HARD_REJECT.test(t.title || '') && !MAINSTREAM.test((t.artist || '') + ' ' + t.title) && (beatsy || !offGenre.test(t.genre || ''))) m.set(t.id, t); });
   const per = new Map(), out = [];
   let order = shuffle([...m.values()]);
   if (tx) order = order.map(t => ({ t, s: tx.TM.w * tx.T.similarity(t, tx.TP) + rng() * 0.6 })).sort((a, b) => b.s - a.s).map(x => x.t);   // lean toward the ♥ profile
+  if (lazy) {   // confirm each pick actually has a free stream before it enters the set
+    const picks = []; for (const t of order) { const c = per.get(t.artistId) || 0; if (c) continue; per.set(t.artistId, 1); picks.push(t); }
+    let i = 0, tried = 0;
+    const worker = async () => { while (out.length < need && i < picks.length && tried < need * 4) { const t = picks[i++]; tried++;
+      try { await prov.resolveStream(t); if (t.url && t.playable !== false && out.length < need) out.push(finalizeTrack(t)); } catch (e) { } } };
+    await Promise.all(Array.from({ length: prov.capabilities.resolveConcurrency || 4 }, worker));
+    if (!out.length && picks.length) throw new Error(prov.name + ': no free streams available here');
+    return out;
+  }
   for (const t of order) { const c = per.get(t.artistId) || 0; if (c) continue; per.set(t.artistId, 1); out.push(finalizeTrack(t)); if (out.length >= need) break; }
   return out;
 }
@@ -713,7 +726,7 @@ async function playFrom(i) {
   S.inTrans = false; S.idx = i; const tr = S.set[i];
   setStatus(`Loading “${tr.title}”…`, 'busy');
   try { await d.load(tr, startPosFor(tr, true)); }
-  catch (e) { tr.bad = true; renderList(); const n = nextIdx(i + 1); if (n >= 0) return playFrom(n); setStatus('Could not load any track · 无法加载', 'err'); return; }
+  catch (e) { tr.bad = true; renderList(); const n = nextIdx(i + 1); if (n >= 0) return playFrom(n); setStatus('Could not load any track', 'err'); return; }
   S.live = d; applyAutoGain(d);
   const t = ctx.currentTime + 0.05;
   await d.el.play().catch(e => console.warn(e));
@@ -722,7 +735,7 @@ async function playFrom(i) {
   curve(d.xf.gain, 0, 1, t, fadeEnd, 'eqp');
   if (opt('autoFx').checked) { const f = filterFreqs(d.knob.filter); d.lp.frequency.setValueAtTime(400, t); expo(d.lp.frequency, f.lp, fadeEnd); showFx('INTRO FILTER', t, false, fadeEnd - t, d.name); }
   S.segStart = d.el.currentTime; computeTransAt(); S.lastFlourish = -1;
-  setStatus('Live · 正在播放', 'ok'); renderAll(); preloadNext();
+  setStatus('Live', 'ok'); renderAll(); preloadNext();
 }
 
 function chooseScript(D, I, synced) {
@@ -852,7 +865,7 @@ function finishTransition(D, I, to) {
   D.auto = I.auto = false; D.ready = false;
   S.live = I; S.idx = to; S.inTrans = false; S.segStart = I.el.currentTime; S.lastFlourish = -1;
   $('#xfadeBadge').classList.remove('on');
-  computeTransAt(); renderAll(); setStatus('Live · 正在播放', 'ok');
+  computeTransAt(); renderAll(); setStatus('Live', 'ok');
   setTimeout(preloadNext, 1500);
 }
 function outro() {
@@ -862,7 +875,7 @@ function outro() {
   curve(D.xf.gain, 1, 0, T, T1); D.rSend.gain.setValueAtTime(D.knob.reverb * 0.9, T); lin(D.rSend.gain, 0.8, T1);
   D.lp.frequency.setValueAtTime(filterFreqs(D.knob.filter).lp, T); expo(D.lp.frequency, 500, T1); showFx('OUTRO WASH', T, true, T1 - T, D.name);
   setTimeout(() => { D.el.pause(); D.restore(ctx.currentTime); S.inTrans = false; S.playing = false; S.live = null; S.idx = S.set.length; document.body.classList.remove('playing');
-    renderAll(); setStatus('Set complete · 完成 — Generate for another', 'ok'); }, (T1 - ctx.currentTime) * 1000 + 3000);
+    renderAll(); setStatus('Set complete', 'ok'); }, (T1 - ctx.currentTime) * 1000 + 3000);
 }
 function onDeckError(d) {
   if (!d.track || !d.el.src) return;
@@ -943,7 +956,7 @@ async function steer() {
   if (same(genres, S.params.genres || []) && same(moods, S.params.moods || [])) return;
   const label = [...genres.map(g => GENRES[g].label), ...moods.map(m => MOODS[m].label)].join(' · ');
   S.steering = true; const bid = S.buildId;
-  setStatus(`Shifting to ${label}… · 转向`, 'busy'); const chip = showFx('SHIFTING → ' + label.toUpperCase(), fxNow(), false, 30, null, 'ride');
+  setStatus(`Shifting to ${label}…`, 'busy'); const chip = showFx('SHIFTING → ' + label.toUpperCase(), fxNow(), false, 30, null, 'ride');
   try {
     const params = { ...S.params, genres, moods, prompt: $('#prompt').value.trim(), source: S.params.source, taste: opt('taste').value };
     const keepN = Math.min(S.set.length, Math.max(0, S.idx) + 2);           // playing + already-cued next stay
@@ -971,7 +984,7 @@ async function steer() {
     S.set = keep.concat(bridges, tail);
     S.params = { ...params, genres: res.info.genres, moods: res.info.moods };   // endless mode digs the new vibe from now on
     renderList(); analyzeAll();
-    setStatus(`Steering → ${label} · ${bridges.length} bridge track${bridges.length > 1 ? 's' : ''}, then ${tail.length} new`, 'ok');
+    setStatus(`Shifting to ${label} · ${bridges.length} bridge track${bridges.length > 1 ? 's' : ''}, then ${tail.length} new`, 'ok');
     showFx('SET STEERED → ' + label.toUpperCase(), fxNow(), true, 3);
   } catch (e) { console.warn('steer failed', e); setStatus('Could not shift the set — try again', 'err'); }
   finally { S.steering = false; if (chip) chip.t1 = Math.min(chip.t1, fxNow()); }
@@ -1072,16 +1085,18 @@ function renderFx(now) {
     if (ev.el) { const p = clamp((now - ev.t0) / Math.max(0.05, ev.t1 - ev.t0), 0, 1); ev.bar.style.transform = `scaleX(${p.toFixed(3)})`; if (now > ev.t1 && !ev.out) { ev.out = true; ev.el.classList.add('out'); } }
   }
 }
+const EMPTY_SET = '<li class="empty"><span class="ei">♪</span><b>No set yet</b><span>Pick a genre, then Generate &amp; Play</span></li>';
+const EMPTY_LIKES = '<li class="empty"><span class="ei">♡</span><b>No likes yet</b><span>Tap ♡ on a track you love</span></li>';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 function buildChips() {
   const saved = JSON.parse(localStorage.getItem('neondj.sel') || '{"g":["deep-house"],"m":["groovy"]}');
-  $('#genres').innerHTML = Object.entries(GENRES).map(([k, v]) => `<button class="chip${saved.g.includes(k) ? ' on' : ''}" data-k="${k}">${v.label}<small>${v.zh}</small></button>`).join('');
-  $('#moods').innerHTML = Object.entries(MOODS).map(([k, v]) => `<button class="chip${saved.m.includes(k) ? ' on' : ''}" data-k="${k}">${v.label}<small>${v.zh}</small></button>`).join('');
+  $('#genres').innerHTML = Object.entries(GENRES).map(([k, v]) => `<button class="chip${saved.g.includes(k) ? ' on' : ''}" data-k="${k}" title="${v.zh}">${v.label}</button>`).join('');
+  $('#moods').innerHTML = Object.entries(MOODS).map(([k, v]) => `<button class="chip${saved.m.includes(k) ? ' on' : ''}" data-k="${k}" title="${v.zh}">${v.label}</button>`).join('');
   $$('.chip').forEach(c => c.addEventListener('click', () => { c.classList.toggle('on'); saveSel(); scheduleSteer(); }));
 }
 /* Source <select> options come from the provider registry (order of registration) */
-function buildSources() { opt('source').innerHTML = Providers.list().map(p => `<option value="${esc(p.id)}"${p.id === Providers.defaultId ? ' selected' : ''}>${esc(p.label)}</option>`).join(''); }
+function buildSources() { const cur = opt('source').value; opt('source').innerHTML = Providers.usable().map(p => `<option value="${esc(p.id)}" title="${esc(p.hint || '')}"${p.id === Providers.defaultId ? ' selected' : ''}>${esc(p.label)}</option>`).join(''); if (cur && Providers.usable().some(p => p.id === cur)) opt('source').value = cur; }
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
 const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiModel'];
@@ -1099,7 +1114,7 @@ async function build() {
   const need = clamp(Math.ceil(+opt('setLen').value * 60 / eff) + 1, 4, 30);
   S.buildId++;
   try {
-    setStatus('Digging crates… 挖掘唱片', 'busy');
+    setStatus('Finding tracks…', 'busy');
     let res;
     try { res = await digCrates({ ...params, need, onStatus: s => setStatus(s, 'busy') }); if (!res.tracks.length) throw new Error('no tracks'); }
     catch (e) {
@@ -1114,16 +1129,16 @@ async function build() {
     if (S.playing && S.live && !S.inTrans) {     // keep the groove: current track stays, new set mixes in after it
       const cur = S.live.track; S.set = sequence(fresh.filter(t => t.id !== cur.id), opt('order').value, [cur]); S.idx = 0;
       const o = other(S.live); o.ready = false; o.track = null; S.preloading = null; computeTransAt(); renderAll(); preloadNext();
-      setStatus(`New set queued · ${fresh.length} tracks after this one`, 'ok');
+      setStatus(`New set queued · ${fresh.length} tracks`, 'ok');
     } else {
       S.set = fresh; S.idx = -1; renderAll();
       // listen first: analyse the crate (bounded time) so the opener and arc are chosen from real audio features
       let done = 0; const deadline = sleep(14000);
       const job = pool(fresh, 3, async t => { try { t.an = await analyzeTrack(t); if (!t.bpm && t.an.conf > 1.15) t.bpm = t.an.est; } catch (e) { t.anFail = true; }
-        done++; if (!S.playing) setStatus(`Listening to the crate ${done}/${fresh.length} · 分析节拍与能量`, 'busy'); });
+        done++; if (!S.playing) setStatus(`Analysing ${done}/${fresh.length}…`, 'busy'); });
       await Promise.race([job, deadline]);
       S.set = sequence(fresh.filter(t => !t.bad), opt('order').value, []); renderAll();
-      setStatus(`Found ${fresh.length} tracks${res.poolSize ? ' from ' + res.poolSize + ' candidates' : ''}${res.liked ? ' · ' + res.liked + ' ♥' : ''} · starting…`, 'busy');
+      setStatus('Starting…', 'busy');
       await playFrom(0);
     }
     analyzeAll();
@@ -1138,7 +1153,7 @@ function updateListInfo() {
 }
 function renderList() {
   const ol = $('#tracklist');
-  if (!S.set.length) { ol.innerHTML = '<li class="empty">Your set appears here · 歌单将显示在这里</li>'; return; }
+  if (!S.set.length) { ol.innerHTML = EMPTY_SET; return; }
   ol.innerHTML = S.set.map((t, i) => {
     const cls = [i === S.idx ? 'cur' : '', i < S.idx ? 'done' : '', t.bad ? 'bad' : ''].join(' ');
     const bpm = t.bpm ? Math.round(t.bpm) : (t.an || t.anFail ? '—' : '…');
@@ -1155,10 +1170,10 @@ function artFallback(img) {   // some sources mirror artwork on several hosts (T
   if (m && img._k < m.length) { try { const u = new URL(img.src); img.src = m[img._k++] + u.pathname; return; } catch (e) { } }
   img.onerror = null; img.style.visibility = 'hidden';
 }
-function renderUpNext() { const i = nextIdx(S.idx + 1); $('#upNext').textContent = i >= 0 ? `${S.set[i].title} — ${S.set[i].artist}` : (S.set.length ? (opt('endless').checked ? 'digging more…' : 'end of set') : '—'); }
+function renderUpNext() { const i = nextIdx(S.idx + 1); $('#upNext').textContent = i >= 0 ? `${S.set[i].title} — ${S.set[i].artist}` : (S.set.length ? (opt('endless').checked ? 'finding more…' : 'end of set') : '—'); }
 /* ---------- ♥ likes UI (store + taste logic in taste.js) ---------- */
 const Likes = NEONDJ.taste.Likes;
-const heartBtn = (t, i) => { const on = Likes.has(t); return `<button class="heart${on ? ' on' : ''}" data-like="${i}" title="${on ? 'Unlike · 取消红心' : 'Like · 加红心'}" aria-pressed="${on}">${on ? '♥' : '♡'}</button>`; };
+const heartBtn = (t, i) => { const on = Likes.has(t); return `<button class="heart${on ? ' on' : ''}" data-like="${i}" title="${on ? 'Unlike' : 'Like'}" aria-pressed="${on}">${on ? '♥' : '♡'}</button>`; };
 function toggleLike(t, el) {
   if (!t) return; const on = Likes.toggle(t);
   if (el) { el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop'); }
@@ -1167,7 +1182,7 @@ function toggleLike(t, el) {
 function renderLikeNow() {
   const t = S.live && S.live.track, b = $('#likeNow'); if (!b) return;
   const on = !!t && Likes.has(t); b.disabled = !t; b.classList.toggle('on', on); b.textContent = on ? '♥' : '♡'; b.setAttribute('aria-pressed', on);
-  b.title = t ? (on ? 'Unlike · 取消红心 (L)' : 'Like this track · 加红心 (L)') : 'Play something to like it';
+  b.title = t ? (on ? 'Unlike (L)' : 'Like (L)') : 'Play something to like it';
 }
 function renderLikes() {
   const n = Likes.count(); $('#likedCount').textContent = n; $('#likedBtnCount').textContent = n;
@@ -1177,8 +1192,8 @@ function renderLikes() {
       <span class="n">${i + 1}</span><img loading="lazy" src="${esc(t.artSmall || t.art || '')}" alt="" onerror="this.style.visibility='hidden'">
       <span class="t"><b>${t.link ? `<a href="${esc(t.link)}" target="_blank" rel="noopener">${esc(t.title)}</a>` : esc(t.title)}</b><span>${esc(t.artist)}${t.genre ? ' · ' + esc(t.genre) : ''}${t.src ? ' · ' + esc((Providers.get(t.src) || { name: t.src }).name) : ''}</span></span>
       <span class="bpm">${t.bpm ? `<b>${Math.round(t.bpm)}</b> bpm` : ''}<br>${esc((camelot(t.key) || {}).s || '')}</span>
-      <button class="heart on" data-unlike="${esc(Likes.key(t))}" title="Unlike · 取消红心">♥</button></li>`).join('')
-    : '<li class="empty">No likes yet — tap ♡ on a track you love · 听到喜欢的歌点 ♡</li>';
+      <button class="heart on" data-unlike="${esc(Likes.key(t))}" title="Unlike">♥</button></li>`).join('')
+    : EMPTY_LIKES;
   const P = NEONDJ.taste.profile(all);
   $('#tasteSummary').textContent = P ? [P.genres.size ? [...P.genres.entries()].filter(x => x[0]).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]).join(' / ') : '',
     P.bpm ? `${Math.round(P.bpm.lo + 4)}–${Math.round(P.bpm.hi - 4)} BPM` : '', P.topTags.slice(0, 4).join(', ')].filter(Boolean).join(' · ') : '';
@@ -1191,10 +1206,10 @@ function exportLikes() {
   const blob = new Blob([JSON.stringify(Likes.exportData(), null, 1)], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `muse-likes-${new Date().toISOString().slice(0, 10)}.json`;
   document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-  setStatus(`Exported ${Likes.count()} likes · 已导出`, 'ok');
+  setStatus(`Exported ${Likes.count()} likes`, 'ok');
 }
 async function importLikes(file) {
-  try { const r = Likes.importData(JSON.parse(await file.text())); setStatus(`Imported ${r.added} likes (${r.total} total${r.skipped ? ', ' + r.skipped + ' skipped' : ''}) · 已导入`, 'ok'); }
+  try { const r = Likes.importData(JSON.parse(await file.text())); setStatus(`Imported ${r.added} likes (${r.total} total${r.skipped ? ', ' + r.skipped + ' skipped' : ''})`, 'ok'); }
   catch (e) { setStatus('Import failed: ' + (e.message || e), 'err'); }
 }
 function bindLikes() {
@@ -1381,7 +1396,7 @@ function padUp(id) {
 }
 const segLabel = b => b < 1 ? '1/' + Math.round(1 / b) : String(b);
 function buildPads() {
-  $('#padgrid').innerHTML = PADS.map(p => `<button class="pad" data-id="${p.id}" title="${p.hold ? 'Hold' : 'Tap'} · key ${p.k}">${p.label}<small>${p.zh} · ${p.k}</small></button>`).join('');
+  $('#padgrid').innerHTML = PADS.map(p => `<button class="pad" data-id="${p.id}" title="${p.zh} · ${p.hold ? 'hold' : 'tap'} · key ${p.k}">${p.label}<kbd>${p.k}</kbd></button>`).join('');
   $$('.pad').forEach(b => {
     const p = PADS.find(x => x.id === b.dataset.id);
     b.addEventListener('pointerdown', e => { e.preventDefault(); b.setPointerCapture(e.pointerId); b.classList.add('on'); padDown(p.id); });
@@ -1412,10 +1427,10 @@ async function togglePlay() {
   if (S.paused) {
     await ctx.resume(); S.paused = false;
     S.decks.forEach(d => { if (d._wasPlaying) d.el.play().catch(() => { }); d._wasPlaying = false; });
-    setStatus('Live · 正在播放', 'ok'); document.body.classList.add('playing');
+    setStatus('Live', 'ok'); document.body.classList.add('playing');
   } else {
     S.paused = true; S.decks.forEach(d => { d._wasPlaying = !d.el.paused; d.el.pause(); }); await ctx.suspend();
-    setStatus('Paused · 已暂停', ''); document.body.classList.remove('playing');
+    setStatus('Paused', ''); document.body.classList.remove('playing');
   }
 }
 
@@ -1456,7 +1471,7 @@ function draw() {
     const tr = d.track, t = d.el.currentTime, dur = tr.dur || d.el.duration || 1;
     $('#nowBar').style.width = (t / dur * 100).toFixed(2) + '%';
     $('#nowTime').textContent = fmt(t); $('#nowLeft').textContent = S.inTrans ? 'mixing' : '-' + fmt(Math.max(0, S.transAt - t)) + ' to mix';
-    $('#bpmNow').textContent = tr.bpm ? `BPM ${(tr.bpm * d.el.playbackRate).toFixed(1)}${tr.an ? '' : ' (grid est.)'}` : 'BPM —';
+    $('#bpmNow').textContent = tr.bpm ? `${(tr.bpm * d.el.playbackRate).toFixed(1)} BPM` : '— BPM';
   }
   if (ctx && S.decks.length) updateDecks(performance.now());
   renderFx(fxNow());
@@ -1467,7 +1482,7 @@ function draw() {
 function init() {
   buildChips(); buildSources(); buildPads(); loadOpts(); renderList(); bindLikes();
   buildDeckShell($('#deckA'), 'A'); buildDeckShell($('#deckB'), 'B');
-  if (!Providers.get(opt('source').value)) opt('source').value = Providers.defaultId;   // stale / removed provider id
+  if (!Providers.usable().some(p => p.id === opt('source').value)) opt('source').value = Providers.defaultId;   // stale / removed provider id
   viz.c = $('#viz'); viz.g = viz.c.getContext('2d'); requestAnimationFrame(draw);
   $('#buildBtn').addEventListener('click', build);
   $('#playBtn').addEventListener('click', togglePlay);
@@ -1492,6 +1507,17 @@ function init() {
   $('#aiKey').value = localStorage.getItem('neondj.aikey') || '';
   $('#aiKey').addEventListener('change', e => { e.target.value ? localStorage.setItem('neondj.aikey', e.target.value) : localStorage.removeItem('neondj.aikey'); });
   $('#prompt').addEventListener('keydown', e => { if (e.key === 'Enter') build(); });
+  // NetEase proxy (Advanced): the NetEase source only appears in the Source menu once a proxy URL is saved
+  $('#neteaseProxy').value = Providers.settings.get('neteaseProxy');
+  $('#proxySave').addEventListener('click', async () => {
+    const v = $('#neteaseProxy').value.trim().replace(/\/+$/, '');
+    if (v && !/^https:\/\/[^\s/]+/i.test(v) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(v)) { setStatus('Proxy URL must start with https://', 'err'); return; }
+    Providers.settings.set('neteaseProxy', v); buildSources();
+    if (!v) { setStatus('NetEase proxy removed', ''); return; }
+    setStatus('Checking proxy…', 'busy');
+    try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
+    catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
+  });
   window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, build, digCrates, sequence, analyzeTrack, transition, SCRIPTS });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();

@@ -13,7 +13,7 @@
   const KEY = 'neondj.likes';
   // fields kept per like: enough to show it, re-find it, score against it and re-stream it
   const FIELDS = ['src', 'id', 'title', 'artist', 'artistId', 'genre', 'mood', 'bpm', 'key', 'tags', 'link', 'art', 'artSmall', 'artMirrors',
-    'url', 'dur', 'fullDur', 'preview', 'plays', 'prior'];
+    'url', 'hash', 'mid', 'nid', 'dur', 'fullDur', 'preview', 'plays', 'prior'];
   const keyOf = t => t.src + ':' + t.id;
   const valid = r => r && typeof r === 'object' && typeof r.src === 'string' && r.id != null && r.id !== '' && typeof r.title === 'string';
   const norm = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();

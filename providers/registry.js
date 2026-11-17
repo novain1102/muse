@@ -8,7 +8,8 @@
  *
  *   id            string   unique, stable; stored in localStorage ('neondj.opts'.source) and in Track.src
  *   name          string   short display name used in status lines ("Connecting to <name>…")
- *   label         string   text of its option in the Source <select> ("Audius (full tracks)")
+ *   label         string   text of its option in the Source <select> ("Audius")
+ *   hint          string?  tooltip of that option ("Independent artists · full tracks")
  *   capabilities  object   see CAPS_DEFAULT below
  *   fallback      string?  id of the provider to try when this one fails or returns nothing
  *   genreFilters  object?  app genre id ('house', 'techno', …) -> [source genre values] used as search filters
@@ -23,6 +24,10 @@
  *                                       Normally called inside your normalizer to fill Track.url.
  *   async resolveStream(track)          optional; for sources whose URLs are signed/expiring: fill or refresh
  *                                       track.url / track.alt right before a deck loads or analysis fetches it.
+ *                                       Throw (or set track.playable = false) when the platform serves no free audio.
+ *   keywords      object?  { genres: {app genre id: [search terms]}, moods: {app mood id: [terms]} } — for 'simple'
+ *                          crates: replaces the app's English seed terms (e.g. Chinese + English terms for CN platforms)
+ *   available()   optional; false = hide from the Source menu (e.g. needs a proxy URL that isn't configured yet)
  *
  * Rate limits: use NEONDJ.providers.net.fetchJSON — it retries once with jittered back-off on
  * HTTP 429 / 5xx / aborts / network errors. Throwing from search() is fine: the dig pool swallows
@@ -69,6 +74,7 @@
     crate: 'simple',        // 'scored' = rich popularity signals -> full taste filter + trending top-up;
                             // 'simple' = shuffle + one-per-artist dig with basic reject rules (preview catalogues)
     rateLimited: false,     // informational: source is known to answer HTTP 429 under bursts
+    resolveConcurrency: 4,  // parallel resolveStream() calls while a 'simple' crate confirms picks (lower for throttling sources)
   };
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -83,11 +89,36 @@
     catch (e) { if (retry > 0 && /HTTP (429|5\d\d)|abort|Failed to fetch/i.test(String(e.message || e))) { await sleep(1200 + Math.random() * 1200); return fetchJSON(url, timeout, opts, retry - 1); } throw e; }
   }
 
+  /* JSONP for keyless APIs that send no CORS headers but accept a callback parameter (script-tag GET only).
+   * Each call gets a unique global callback; the script tag is removed and the callback cleared afterwards. */
+  let jsonpSeq = 0;
+  function jsonp(url, { param = 'callback', timeout = 10000, extra = '' } = {}) {
+    return new Promise((resolve, reject) => {
+      const name = '__muse_jp' + Date.now().toString(36) + (jsonpSeq++);
+      const s = document.createElement('script');
+      const done = (err, data) => { clearTimeout(to); try { delete window[name]; } catch (e) { window[name] = undefined; } s.remove(); err ? reject(err) : resolve(data); };
+      const to = setTimeout(() => { window[name] = () => { }; done(new Error('JSONP timeout')); }, timeout);
+      window[name] = data => done(null, data);
+      s.onerror = () => done(new Error('JSONP load failed'));
+      s.src = url + (url.includes('?') ? '&' : '?') + param + '=' + name + extra;
+      s.referrerPolicy = 'no-referrer';
+      document.head.appendChild(s);
+    });
+  }
+  /* small settings store for providers (e.g. a proxy URL entered under Advanced) */
+  const SETTINGS_KEY = 'neondj.provsettings';
+  const settings = {
+    all() { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch (e) { return {}; } },
+    get(k) { return this.all()[k] || ''; },
+    set(k, v) { const a = this.all(); if (v) a[k] = v; else delete a[k]; localStorage.setItem(SETTINGS_KEY, JSON.stringify(a)); },
+  };
+
   const list = [], byId = new Map();
   let defaultId = null;
 
   const Providers = {
-    net: { fetchJSON, sleep },
+    net: { fetchJSON, sleep, jsonp },
+    settings,
     CAPS_DEFAULT,
     /* register a provider; the first one registered (or one with isDefault) becomes the default */
     register(p) {
@@ -104,6 +135,8 @@
     /* provider for an id, or the default when the id is unknown (e.g. stale localStorage value) */
     resolve(id) { return byId.get(id) || byId.get(defaultId) || null; },
     list() { return list.slice(); },
+    /* providers that can be picked right now (available() false = hidden, e.g. proxy not configured) */
+    usable() { return list.filter(p => typeof p.available !== 'function' || p.available()); },
     get defaultId() { return defaultId; },
     fallbackFor(id) { const p = byId.get(id); return p && p.fallback && p.fallback !== id ? byId.get(p.fallback) || null : null; },
     caps(trackOrId) { const id = typeof trackOrId === 'string' ? trackOrId : trackOrId && trackOrId.src; const p = byId.get(id); return p ? p.capabilities : CAPS_DEFAULT; },

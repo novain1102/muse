@@ -13,25 +13,30 @@
 
 <header class="top glass">
   <div class="brand"><span class="logo"></span><b>Muse</b><small>Your AI DJ</small></div>
-  <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">Ready · 就绪</span></div>
+  <div class="topr">
+    <div class="status" aria-live="polite"><span id="statusDot" class="dot"></span><span id="statusText">Ready</span></div>
+    <button id="tourBtn" class="btn ghost round" type="button" title="Show the quick tour" aria-label="Show the quick tour">?</button>
+  </div>
 </header>
 
 <main class="layout">
-  <!-- LEFT: generator -->
+  <!-- LEFT: set builder -->
   <section class="panel glass gen">
-    <h2>Set Builder <small>生成歌单</small></h2>
-    <label class="lbl">Vibe prompt <small>一句话描述（可选）</small></label>
-    <input id="prompt" class="inp" type="text" placeholder="e.g. dark late-night techno, 深夜 暗黑 techno" />
+    <h2>Build a set</h2>
+    <input id="prompt" class="inp" type="text" placeholder="Describe a vibe (optional)" title="e.g. dark late-night techno · 深夜 暗黑 techno — Enter to generate" aria-label="Vibe" />
 
-    <label class="lbl">Genre <small>曲风</small></label>
-    <div id="genres" class="chips"></div>
+    <div class="sect" id="genreSect">
+      <label class="lbl">Genre</label>
+      <div id="genres" class="chips"></div>
+    </div>
+    <div class="sect" id="moodSect">
+      <label class="lbl">Mood</label>
+      <div id="moods" class="chips"></div>
+    </div>
 
-    <label class="lbl">Mood <small>情绪</small></label>
-    <div id="moods" class="chips"></div>
-
-    <div class="row2">
+    <div class="grid2">
       <div>
-        <label class="lbl">Set length <small>时长</small></label>
+        <label class="lbl" for="setLen">Length</label>
         <select id="setLen" class="inp">
           <option value="15">15 min</option>
           <option value="30" selected>30 min</option>
@@ -41,104 +46,102 @@
         </select>
       </div>
       <div>
-        <label class="lbl">Per track <small>每首播放</small></label>
+        <label class="lbl" for="perTrack">Per track</label>
         <select id="perTrack" class="inp">
           <option value="90">1:30</option>
           <option value="150" selected>2:30</option>
           <option value="210">3:30</option>
-          <option value="0">Full 完整</option>
-        </select>
-      </div>
-    </div>
-    <div class="row2">
-      <div>
-        <label class="lbl">Order <small>排序</small></label>
-        <select id="order" class="inp">
-          <option value="arc" selected>Arc 起伏 (warm-up→peak→cool-down)</option>
-          <option value="build">Build-up 渐进</option>
-          <option value="found">As found 原始</option>
+          <option value="0">Full</option>
         </select>
       </div>
       <div>
-        <label class="lbl">Source <small>音源</small></label>
-        <select id="source" class="inp"><!-- options are filled from the provider registry (providers/*.js) --></select>
-      </div>
-    </div>
-    <div class="row2">
-      <div>
-        <label class="lbl">Taste <small>品味 ♥</small></label>
-        <select id="taste" class="inp" title="How much your ♥ likes steer the crate digging · 红心对选歌的影响">
-          <option value="off">Off 关</option>
-          <option value="some" selected>Some 适中</option>
-          <option value="strong">Strong 强</option>
+        <label class="lbl" for="order">Order</label>
+        <select id="order" class="inp" title="Arc: warm-up → peak → cool-down">
+          <option value="arc" selected>Arc</option>
+          <option value="build">Build-up</option>
+          <option value="found">As found</option>
         </select>
       </div>
       <div>
-        <label class="lbl">Liked <small>红心</small></label>
-        <button id="likedBtn" class="btn likedbtn" type="button" title="Show liked tracks · 查看红心歌曲"><span class="hrt">♥</span> <b id="likedBtnCount">0</b> <small>liked</small></button>
+        <label class="lbl" for="source">Source</label>
+        <select id="source" class="inp" title="Where the music comes from"><!-- filled from the provider registry (providers/*.js) --></select>
+      </div>
+      <div>
+        <label class="lbl" for="taste">Taste</label>
+        <select id="taste" class="inp" title="How much your ♥ likes steer track picks">
+          <option value="off">Off</option>
+          <option value="some" selected>Some</option>
+          <option value="strong">Strong</option>
+        </select>
+      </div>
+      <div>
+        <label class="lbl">Liked</label>
+        <button id="likedBtn" class="btn likedbtn" type="button" title="Show liked tracks"><span class="hrt">♥</span> <b id="likedBtnCount">0</b></button>
       </div>
     </div>
-    <button id="buildBtn" class="btn primary">⚡ Generate &amp; Play <small>生成并播放</small></button>
+    <button id="buildBtn" class="btn primary"><span class="pi">▶</span> Generate &amp; Play</button>
     <details class="ai">
-      <summary>Advanced · 高级设置</summary>
-      <label class="tog" style="margin-top:10px"><input id="aiOn" type="checkbox" /><span>Keyword expansion · 关键词扩展</span></label>
-      <p class="hint">Optional. Turns your vibe into a few extra search keywords using your own OpenAI API key (one short request per set, cached). Off by default; the key stays in this browser.</p>
-      <input id="aiKey" class="inp" type="password" placeholder="API key (sk-…)" autocomplete="off" />
+      <summary>Advanced</summary>
+      <label class="tog" title="Optional. Turns your vibe into a few extra search keywords with your own OpenAI API key (one short request per set, cached). The key stays in this browser."><input id="aiOn" type="checkbox" /><span>Keyword expansion</span></label>
+      <input id="aiKey" class="inp" type="password" placeholder="OpenAI API key (sk-…)" autocomplete="off" />
       <input id="aiModel" class="inp" type="text" value="gpt-4o-mini" title="Model" />
+      <label class="lbl" for="neteaseProxy" title="NetEase Cloud Music needs a small proxy you host yourself — see providers/proxy/README.md">NetEase proxy</label>
+      <div class="inrow"><input id="neteaseProxy" class="inp" type="url" placeholder="https://your-proxy.workers.dev" autocomplete="off" /><button id="proxySave" class="btn mini" type="button">Save</button></div>
     </details>
   </section>
 
-  <!-- CENTER: decks / visualizer -->
+  <!-- CENTER: now playing, transport, FX, decks -->
   <section class="center">
     <div class="panel glass viz">
       <canvas id="viz"></canvas>
       <div class="now">
         <img id="nowArt" class="art" alt="" />
         <div class="meta">
-          <div class="tag">NOW PLAYING · 正在播放</div>
-          <div id="nowTitle" class="title">Pick a vibe and hit Generate</div>
+          <div class="tag">Now playing</div>
+          <div id="nowTitle" class="title">Nothing playing</div>
           <div id="nowArtist" class="artist">—</div>
           <div class="progress"><div id="nowBar"></div></div>
           <div class="times"><span id="nowTime">0:00</span><span id="nowInfo"></span><span id="nowLeft">0:00</span></div>
         </div>
         <button id="likeNow" class="heart big" type="button" disabled title="Play something to like it" aria-pressed="false">♡</button>
       </div>
-      <div id="xfadeBadge" class="xbadge">TRANSITION</div>
+      <div id="xfadeBadge" class="xbadge">MIXING</div>
       <div id="fxlog" class="fxlog"></div>
     </div>
 
     <div class="transport panel glass">
-      <button id="prevBtn" class="btn icon" title="Restart track">⏮</button>
-      <button id="playBtn" class="btn icon big" title="Play / Pause">▶</button>
-      <button id="nextBtn" class="btn icon" title="Mix to next now">⏭</button>
-      <div class="xf">
-        <span>A</span><input id="xfader" type="range" min="0" max="1" step="0.001" value="0" disabled title="Crossfader (automatic)" /><span>B</span>
+      <button id="prevBtn" class="btn icon" title="Restart track" aria-label="Restart track">⏮</button>
+      <button id="playBtn" class="btn icon big" title="Play / Pause" aria-label="Play / Pause">▶</button>
+      <button id="nextBtn" class="btn icon" title="Mix to next now" aria-label="Mix to next">⏭</button>
+      <div class="xf" title="Crossfader (automatic)">
+        <span>A</span><input id="xfader" type="range" min="0" max="1" step="0.001" value="0" disabled aria-label="Crossfader" /><span>B</span>
       </div>
-      <div class="opts">
-        <label class="lbl inline">Crossfade <b id="xfLenVal">8s</b></label>
-        <input id="xfLen" type="range" min="4" max="16" step="1" value="8" />
+      <div class="opts" title="Crossfade length">
+        <span class="olbl">Fade <b id="xfLenVal">8s</b></span>
+        <input id="xfLen" type="range" min="4" max="16" step="1" value="8" aria-label="Crossfade length" />
       </div>
-      <label class="tog"><input id="autoFx" type="checkbox" checked /><span>Auto FX</span></label>
-      <label class="tog"><input id="tempoSync" type="checkbox" checked /><span>Tempo sync</span></label>
-      <label class="tog"><input id="skipIntro" type="checkbox" checked /><span>Skip intros</span></label>
-      <label class="tog"><input id="endless" type="checkbox" checked /><span>Endless 无限</span></label>
-      <select id="fxAmt" class="inp mini" title="Auto FX intensity 效果强度">
-        <option value="subtle">FX: Subtle</option><option value="normal" selected>FX: Normal</option><option value="wild">FX: Wild</option>
-      </select>
+      <div class="togs">
+        <label class="tog" title="Automatic effects during mixes"><input id="autoFx" type="checkbox" checked /><span>Auto FX</span></label>
+        <label class="tog" title="Match tempos when mixing"><input id="tempoSync" type="checkbox" checked /><span>Sync</span></label>
+        <label class="tog" title="Start tracks after their intro"><input id="skipIntro" type="checkbox" checked /><span>Skip intros</span></label>
+        <label class="tog" title="Keep adding tracks when the set ends"><input id="endless" type="checkbox" checked /><span>Endless</span></label>
+        <select id="fxAmt" class="inp mini" title="Auto FX intensity" aria-label="Auto FX intensity">
+          <option value="subtle">Subtle</option><option value="normal" selected>Normal</option><option value="wild">Wild</option>
+        </select>
+      </div>
     </div>
 
     <div class="pads panel glass">
-      <h2>Live FX <small>现场效果 · hold / tap · keys 1–9</small></h2>
-      <div id="padgrid" class="padgrid"></div>
-      <div class="padopts">
-        <span>Beat length 节拍长度</span>
-        <div id="beatSeg" class="seg">
-          <button data-b="0.25">1/4</button><button data-b="0.5">1/2</button><button data-b="1" class="on">1</button><button data-b="2">2</button><button data-b="4">4</button>
+      <div class="phead"><h2 title="Hold or tap a pad · keys 1–9, 0, N">Live FX</h2>
+        <div class="padopts">
+          <div id="beatSeg" class="seg" title="Effect length in beats">
+            <button data-b="0.25">1/4</button><button data-b="0.5">1/2</button><button data-b="1" class="on">1</button><button data-b="2">2</button><button data-b="4">4</button>
+          </div>
+          <div id="targetSeg" class="seg" title="Which deck the pads affect"><button data-t="live" class="on">Live</button><button data-t="A">A</button><button data-t="B">B</button></div>
+          <span id="bpmNow" class="muted">— BPM</span>
         </div>
-        <span>Target 目标</span>
-        <div id="targetSeg" class="seg"><button data-t="live" class="on">Live</button><button data-t="A">A</button><button data-t="B">B</button></div>
-        <span id="bpmNow" class="muted">BPM —</span>
       </div>
+      <div id="padgrid" class="padgrid"></div>
     </div>
 
     <div class="decks">
@@ -149,40 +152,38 @@
 
   <!-- RIGHT: tracklist -->
   <section class="panel glass list" id="listPanel">
-    <h2>Tracklist <small>歌单</small> <span id="listInfo" class="muted"></span></h2>
-    <div class="seg tabs"><button id="tabSet" class="on" type="button">Set · 歌单</button><button id="tabLiked" type="button">♥ Liked · 红心 <b id="likedCount">0</b></button></div>
+    <div class="lhead"><h2>Tracklist</h2><span id="listInfo" class="muted"></span></div>
+    <div class="seg tabs"><button id="tabSet" class="on" type="button">Set</button><button id="tabLiked" type="button">♥ Liked <b id="likedCount">0</b></button></div>
     <div class="setview">
-      <div class="upnext"><span class="tag">UP NEXT · 下一首</span><span id="upNext">—</span></div>
+      <div class="upnext"><span class="tag">Up next</span><span id="upNext">—</span></div>
       <ol id="tracklist" class="tracks"></ol>
     </div>
     <div class="likedview">
       <div class="likebar">
-        <span id="tasteSummary" class="muted" title="Your taste profile · 品味画像"></span>
-        <span class="likeacts"><button id="likesExport" class="btn mini" type="button" title="Download likes as JSON · 导出">Export</button><button id="likesImport" class="btn mini" type="button" title="Merge likes from a JSON file · 导入">Import</button></span>
+        <span id="tasteSummary" class="muted" title="Your taste profile"></span>
+        <span class="likeacts"><button id="likesExport" class="btn mini" type="button" title="Download likes as JSON">Export</button><button id="likesImport" class="btn mini" type="button" title="Merge likes from a JSON file">Import</button></span>
         <input id="likesFile" type="file" accept="application/json,.json" hidden />
       </div>
       <ol id="likedList" class="tracks liked"></ol>
     </div>
-    <div class="master">
-      <label class="lbl inline">Master <small>总音量</small></label>
-      <input id="masterVol" type="range" min="0" max="1" step="0.01" value="0.85" />
+    <div class="master" title="Master volume">
+      <span class="olbl">Master</span>
+      <input id="masterVol" type="range" min="0" max="1" step="0.01" value="0.85" aria-label="Master volume" />
     </div>
   </section>
 </main>
-
-<footer class="foot">Music from <a href="https://audius.co" target="_blank" rel="noopener">Audius</a> independent artists · iTunes previews as backup · mixed live in your browser</footer>
 
 <template id="deckTpl">
   <div class="deckHead"><span class="deckName"></span><span class="deckState">CUE</span><span class="deckTrack muted">empty</span><span class="deckBpm muted"></span></div>
   <div class="deckBody">
     <div class="knobs"></div>
     <div class="strip">
-      <div class="meter" title="Level · 电平"><i class="lv"></i><i class="pk"></i></div>
-      <div class="fader" title="Channel volume · 通道音量"><i class="fv"></i></div>
+      <div class="meter" title="Level"><i class="lv"></i><i class="pk"></i></div>
+      <div class="fader" title="Channel volume"><i class="fv"></i></div>
     </div>
   </div>
   <div class="deckFoot">
-    <div class="pitch" title="Tempo / pitch · 变速"><span>PITCH</span><div class="pbar"><i></i></div><output class="pval">0.0%</output></div>
+    <div class="pitch" title="Tempo / pitch"><span>PITCH</span><div class="pbar"><i></i></div><output class="pval">0.0%</output></div>
     <div class="lamps"><span data-fx="loop">LOOP</span><span data-fx="stutter">STUT</span><span data-fx="echo">ECHO</span><span data-fx="sweep">FILT</span><span data-fx="flanger">FLNG</span><span data-fx="phaser">PHSR</span><span data-fx="wash">VERB</span><span data-fx="brake">STOP</span></div>
   </div>
 </template>
@@ -191,7 +192,12 @@
 <script src="providers/registry.js"></script>
 <script src="providers/audius.js"></script>
 <script src="providers/itunes.js"></script>
+<script src="providers/cn-common.js"></script>
+<script src="providers/kugou.js"></script>
+<script src="providers/qqmusic.js"></script>
+<script src="providers/netease.js"></script>
 <script src="taste.js"></script>
 <script src="app.js"></script>
+<script src="tour.js"></script>
 </body>
 </html>

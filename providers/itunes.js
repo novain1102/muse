@@ -5,7 +5,7 @@
   const P = window.NEONDJ.providers, { fetchJSON } = P.net;
 
   const ITunes = {
-    id: 'itunes', name: 'iTunes', label: 'iTunes (30s previews)',
+    id: 'itunes', name: 'iTunes', label: 'iTunes previews', hint: '30-second previews',
     capabilities: { fullTrack: false, previewSeconds: 30, hasBpmKey: false, rangeRequests: false, filters: false, trending: false, crate: 'simple' },
     async search(term, { limit = 50 } = {}) {
       const u = `https://itunes.apple.com/search?media=music&entity=song&limit=${limit}&term=${encodeURIComponent(term)}`;

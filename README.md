@@ -11,10 +11,18 @@ builds, peaks and cools down, and mixes it on two decks with beat-synced transit
 No build step, no accounts, no API keys. Files: `index.html`, `style.css`, `app.js`, `taste.js` (likes + taste profile), `providers/`.
 
 ## Music sources (providers)
-Music sources are pluggable. `providers/registry.js` defines the provider interface and the normalized `Track`
-that the rest of the app consumes; `providers/audius.js` (default) and `providers/itunes.js` (30 s preview
-fallback) are the built-in sources. To add one (e.g. NetEase Cloud Music / QQ Music), copy
-`providers/_template.js` and follow `providers/README.md` — `app.js` doesn't change.
+Pick one in **Source**. Sources are pluggable (`providers/`, see `providers/README.md`); `app.js` only sees a normalized `Track`.
+
+| Source | What plays | Needs |
+|---|---|---|
+| **Audius** (default) | Full tracks by independent artists, BPM + key | nothing |
+| **iTunes previews** | 30 s previews (Audius's fallback) | nothing |
+| **Kugou 酷狗** | Full songs Kugou streams for free (standard quality); VIP-only songs skipped | nothing — called straight from the page |
+| **QQ Music QQ音乐** | Free songs only, **in mainland China only** (QQ hands out no stream keys elsewhere) | nothing; outside China it falls back to Audius |
+| **NetEase 网易云** | Free full songs; VIP/paid, region-blocked and 30 s trial clips skipped | your own small proxy (Cloudflare Worker, `providers/proxy/`) — hidden from Source until saved under Advanced |
+
+Chinese platforms have no BPM/key data, so Muse measures tempo and energy itself (like the iTunes path).
+If a source finds nothing playable, the set comes from Audius instead. No logins, no VIP/region workarounds.
 
 ## What happens when you press Generate
 1. **Crate digging** – curated seed keywords per genre/mood (sub-genres, scene terms, textures)
@@ -74,19 +82,26 @@ keeps digging the latest selection.
   (or Home/Delete) resets. Grabbing a knob cancels the automation on that parameter and your value wins; the
   next scripted move starts from your setting. Reduced-motion settings turn off easing and glows.
 
+## Interface
+- Quiet by design: short labels, help lives in tooltips (hover a control).
+- First visit shows a short tour (pick a genre → mood → Generate & Play → ♥). **?** in the header replays it; Esc or Skip ends it.
+  Shown once per browser (`localStorage['neondj.tour']`).
+
 ## Live control
 - Pads (hold or tap, keys 1–0, N): loop roll (1/4–4 beats), stutter, echo throw, filter sweep, flanger,
   phaser, reverb wash, tape stop → next track, riser, impact, mix next. Space = play/pause, L = like.
 - Click any track in the list to mix into it now. Generate again while playing to queue a new set after
   the current track. Endless mode digs more tracks before the set runs out.
 
-## Advanced: keyword expansion (off by default)
-Under *Advanced*, you can paste your own OpenAI API key to expand the vibe into a few extra search keywords:
-at most one short request per build, cached in localStorage. Everything else runs as local scripts.
+## Advanced
+- **Keyword expansion** (optional): turns your vibe into a few extra search keywords with your own OpenAI API key
+  (one short request per set, cached; the key stays in this browser). Off by default.
+- **NetEase proxy**: paste your Worker URL (see `providers/proxy/README.md`) and Save — Muse checks it and adds
+  NetEase to Source. Clear + Save removes it. Stored in `localStorage['neondj.provsettings']`.
 
 ## Storage
 Settings and likes keep their original keys (`neondj.opts`, `neondj.sel`, `neondj.likes`, …) so nothing is
-lost after the rename; likes export as `muse-likes-YYYY-MM-DD.json` (older exports import fine).
+lost after the rename (new: `neondj.tour`, `neondj.provsettings`); likes export as `muse-likes-YYYY-MM-DD.json` (older exports import fine).
 
 ## Honest limits
 - Music = whatever independent artists uploaded to Audius; quality varies and the catalogue is not the
@@ -96,3 +111,6 @@ lost after the rename; likes export as `muse-likes-YYYY-MM-DD.json` (older expor
 - Loops are delay-line "slip loops" (the track keeps running underneath), the standard approach for
   streamed audio.
 - iTunes fallback = 30 s previews only, tempo estimated in-browser, short crossfades.
+- Chinese platforms: unofficial web endpoints that can change or rate-limit without notice; search relevance is
+  looser (pop remixes tagged "DJ" turn up), and no BPM/key metadata. Use is subject to each platform's terms —
+  Muse only plays what they stream for free to anonymous listeners.

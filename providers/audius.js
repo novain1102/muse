@@ -25,7 +25,7 @@
     Brooding: .55, Serious: .55, Gritty: .65, Upbeat: .65, Stirring: .6, Empowering: .7, Defiant: .7, Excited: .78, Energizing: .82, Fiery: .85, Rowdy: .88, Aggressive: .9, Other: .5 };
 
   const Audius = {
-    id: 'audius', name: 'Audius', label: 'Audius (full tracks)', isDefault: true, fallback: 'itunes',
+    id: 'audius', name: 'Audius', label: 'Audius', hint: 'Independent artists · full tracks', isDefault: true, fallback: 'itunes',
     capabilities: { fullTrack: true, hasBpmKey: true, rangeRequests: true, filters: true, trending: true, similar: true, crate: 'scored', rateLimited: true },
     genreFilters: GENRE_FILTERS, moodFilters: MOOD_FILTERS,
     host: null,
