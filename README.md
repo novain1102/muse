@@ -1,116 +1,80 @@
-# Muse — Your AI DJ
+# Muse
 
-Pick a genre/mood (or type a vibe like `深夜 暗黑 hypnotic techno`), press **Generate & Play**.
-The app digs free tracks from the Audius network, listens to them, builds a set that warms up,
-builds, peaks and cools down, and mixes it on two decks with beat-synced transitions and FX.
+**Muse — Your AI DJ**
 
-## Run
-- Easiest: double-click `index.html` (Chrome / Edge / Safari / Firefox, internet needed).
-- Or serve the folder: `cd ai-dj && python3 -m http.server 8000` and open http://localhost:8000
+选个曲风，点一下，浏览器里就有一位 DJ 为你挖歌、排歌单、对拍混音，整场不停。
 
-No build step, no accounts, no API keys. Files: `index.html`, `style.css`, `app.js`, `taste.js` (likes + taste profile), `providers/`.
+▶ **在线体验：<https://novain1102.github.io/muse/>**（无需安装、无需账号）
 
-## Music sources (providers)
-Pick one in **Source**. Sources are pluggable (`providers/`, see `providers/README.md`); `app.js` only sees a normalized `Track`.
+![Muse 主界面](docs/home.webp)
 
-| Source | What plays | Needs |
-|---|---|---|
-| **Audius** (default) | Full tracks by independent artists, BPM + key | nothing |
-| **iTunes previews** | 30 s previews (Audius's fallback) | nothing |
-| **Kugou 酷狗** | Full songs Kugou streams for free (standard quality); VIP-only songs skipped | nothing — called straight from the page |
-| **QQ Music QQ音乐** | Free songs only, **in mainland China only** (QQ hands out no stream keys elsewhere) | nothing; outside China it falls back to Audius |
-| **NetEase 网易云** | Free full songs; VIP/paid, region-blocked and 30 s trial clips skipped | your own small proxy (Cloudflare Worker, `providers/proxy/`) — hidden from Source until saved under Advanced |
+| 正在混音（滤波扫频转场，旋钮实时联动） | 国内音源：酷狗 |
+|---|---|
+| ![转场中](docs/mixing.webp) | ![酷狗音源播放中](docs/playing-kugou.webp) |
 
-Chinese platforms have no BPM/key data, so Muse measures tempo and energy itself (like the iTunes path).
-If a source finds nothing playable, the set comes from Audius instead. No logins, no VIP/region workarounds.
+![首次使用引导](docs/tour.webp)
 
-## What happens when you press Generate
-1. **Crate digging** – curated seed keywords per genre/mood (sub-genres, scene terms, textures)
-   go to the Audius search API with genre/mood filters. Trending is only a last-resort top-up.
-2. **Taste filter** – rejects type-beats, nightcore/sped-up, DJ mixes/hour-long uploads, very short
-   tracks, playlist spam; penalises viral/chart-level play counts, pop re-rubs, genre-named SEO titles,
-   channel-style uploaders; rewards mid-range "deeper cut" play counts, high like/repost ratio,
-   matching tags, label-style titles. Max one track per artist.
-3. **Listening** – fetches ~20 s from the start (tempo + beat phase via onset autocorrelation) and a slice
-   from the body (loudness/energy) of each track. Audius also supplies BPM + key for most tracks.
-4. **Sequencing** – energy arc (warm-up → build → peak → cool-down) or build-up, while minimising tempo
-   jumps, clashing keys (Camelot wheel) and same-artist adjacency. Tempo outliers become spares.
-5. **Mixing** – two decks, loudness-matched, tempo-synced (±8 %, half/double aware), transitions land on
-   bars/phrases. Auto FX picks a scripted transition per pair: EQ bass swap, filter sweep, phaser blend,
-   flange out, reverb wash, echo out, loop-roll drop with riser + impact, stutter cut, tape stop.
-   Between transitions it occasionally adds phrase-end flourishes (loop roll, echo throw, filter dip,
-   stutter, riser→drop). Intensity: Subtle / Normal / Wild.
+## 功能
 
-## ♥ Likes & taste (红心 → 按你的品味挖歌)
-- Tap **♡** on the now-playing card (or press **L**) or on any row in the tracklist to like a track; tap again to un-like.
-  Likes are stored in this browser (`localStorage['neondj.likes']`). The **♥ Liked** tab (or the *Liked* button in Set
-  Builder) lists them, shows a one-line taste summary, lets you un-heart, and **Export / Import** them as JSON
-  (import merges, duplicates skipped) — keep a copy so clearing browser data doesn't lose your taste.
-- **Taste** (Off / Some / Strong, default Some) sets how much likes steer the next set. With no likes, or Off, digging is
-  exactly as before. Otherwise, per build:
-  1. a *taste profile* is made from your likes: favourite artists, genres, moods, recurring tags, BPM range (10th–90th
-     percentile), Camelot keys and how "deep" (play counts) your likes are;
-  2. extra searches go out for your most-liked artists and recurring tags (Some: 2 + 2, Strong: 3 + 3), plus the source's
-     "more like this" for 1–2 liked tracks when it has one (Audius: tracks by artists related to the liked artist);
-  3. every candidate still goes through the same anti-chart taste filter, then gets bonus points for looking like your
-     likes (same/liked artist, genre, mood, shared tags, tempo in your range, compatible key, similar depth) — weight
-     ×0.55 for Some, ×1.1 for Strong;
-  4. a few liked tracks that fit the current genres/tempo are mixed back in (Some ≈10 % max 2, Strong ≈25 % max 5).
-  One track per artist still applies. If no genre/mood/prompt is picked, the set starts from your most-liked genres.
-- All scripted and deterministic. Works through the provider interface, so it carries over to new sources.
+- **自动挖歌 + 品味过滤**：按曲风 / 情绪用细分风格关键词搜索，过滤 type beat、加速版、DJ 合集、刷量爆款，偏好"有品的冷门好歌"，同一艺人只取一首。
+- **能量曲线排歌**：热场 → 推高 → 高潮 → 收尾；结合 BPM 与 Camelot 调性，减少速度跳变和调性冲突。
+- **双 Deck 自动混音**：响度对齐、自动对拍（±8%），转场落在小节 / 乐句上；低音互换、滤波扫频、回声收尾、Loop Roll、混响冲刷、刹盘等脚本化转场。
+- **像真人 DJ 一样 ride 参数**：两次转场之间按乐句做克制的 EQ、滤波、增益、回声 / 混响动作；旋钮、电平、推子、音调和效果灯全部实时动画显示，随时可以手动接管（拖动旋钮，双击复位）。
+- **现场效果垫**：按住 / 点按或键盘 1–9、0、N 触发，效果标签带进度条，垫子随节拍闪动。
+- **♥ 红心与口味**：给喜欢的歌点 ♥，之后的歌单会向你的口味靠拢（关 / 适中 / 强）；支持导出 / 导入。
+- **播放中换风格**：中途切换曲风 / 情绪，约 1.5 秒后自动重新挖歌，保留当前和下一首，用 BRIDGE 过渡曲平滑转到新风格。
+- **多音源**：
 
-## Steering a playing set (换风格不用重来)
-Change the Genre / Mood chips while a set is playing — no need to press Generate. After ~1.5 s Muse digs the
-new selection in the background ("Shifting to Tech House…"), keeps the playing track and the already-cued next
-one, then queues **bridge** tracks (one from the old crate leaning toward the new tempo, then the new track
-closest to it in tempo/key, tagged BRIDGE in the list), followed by the new style as a build-up. Endless mode
-keeps digging the latest selection.
+  | 音源 | 内容 |
+  |---|---|
+  | Audius（默认） | 独立音乐人完整曲目，自带 BPM / 调性 |
+  | 酷狗 | 平台免费提供的完整歌曲，无需代理 |
+  | QQ 音乐 | 免费歌曲，**仅中国大陆网络可播放**，其他地区自动改用 Audius |
+  | 网易云 | 需自建一个小代理（[部署说明](providers/proxy/README.md)），在"高级"中填写后出现 |
+  | iTunes | 30 秒试听，作为备用 |
 
-## Live decks (what you see)
-- Every deck control is drawn from the real audio-node values each frame: 3-band EQ, filter (LP/HP with
-  frequency), echo, reverb and gain knobs (arc + pointer + value), a level meter with peak hold, the
-  channel volume (crossfader gain), pitch/tempo offset and BPM, plus FX lamps (LOOP, STUT, ECHO, FILT,
-  FLNG, PHSR, VERB, STOP) that light while that effect is actually running. A knob glows lime with a dot
-  while automation is moving it away from your setting.
-- With Auto FX on, Muse rides the mix like a DJ between transitions — at most one tasteful move per
-  16-beat phrase, timed to the beat grid and finished before the phrase ends: high-shelf or low cuts, a mid
-  lift, low-pass "breaths", high-pass sweeps into a phrase end, small gain rides, echo taps, reverb tails.
-  Transitions add bass swaps, filter sweeps, echo-outs, loop rolls, tape stops, risers and impacts.
-- Every effect shows a chip in the visualizer with its deck and a progress bar; the matching pad lights up and
-  pulses on the beat while it runs. FX intensity (Subtle / Normal / Wild) scales how often this happens.
-- Manual control: drag a knob up/down (Shift = fine), mouse wheel, or arrow keys when focused; double-click
-  (or Home/Delete) resets. Grabbing a knob cancels the automation on that parameter and your value wins; the
-  next scripted move starts from your setting. Reduced-motion settings turn off easing and glows.
+- **新手引导**：首次打开有 4 步引导（选曲风 → 情绪 → 生成 → ♥），右上角 **?** 可重看。
 
-## Interface
-- Quiet by design: short labels, help lives in tooltips (hover a control).
-- First visit shows a short tour (pick a genre → mood → Generate & Play → ♥). **?** in the header replays it; Esc or Skip ends it.
-  Shown once per browser (`localStorage['neondj.tour']`).
+## 技术原理
 
-## Live control
-- Pads (hold or tap, keys 1–0, N): loop roll (1/4–4 beats), stutter, echo throw, filter sweep, flanger,
-  phaser, reverb wash, tape stop → next track, riser, impact, mix next. Space = play/pause, L = like.
-- Click any track in the list to mix into it now. Generate again while playing to queue a new set after
-  the current track. Endless mode digs more tracks before the set runs out.
+整套 DJ 是**浏览器里 100% 脚本化的 Web Audio**，没有服务器，播放过程中**不消耗任何 AI token**。
+"高级"里的关键词扩展是可选项，默认关闭；开启后每次生成最多调用一次（用你自己的 key），结果会缓存。
 
-## Advanced
-- **Keyword expansion** (optional): turns your vibe into a few extra search keywords with your own OpenAI API key
-  (one short request per set, cached; the key stays in this browser). Off by default.
-- **NetEase proxy**: paste your Worker URL (see `providers/proxy/README.md`) and Save — Muse checks it and adds
-  NetEase to Source. Clear + Save removes it. Stored in `localStorage['neondj.provsettings']`.
+```
+找歌筛歌 → 听歌分析 → 排歌单 → 混音转场 → 实时 ride → 动态转向
+```
 
-## Storage
-Settings and likes keep their original keys (`neondj.opts`, `neondj.sel`, `neondj.likes`, …) so nothing is
-lost after the rename (new: `neondj.tour`, `neondj.provsettings`); likes export as `muse-likes-YYYY-MM-DD.json` (older exports import fine).
+1. **找歌筛歌**：各音源的搜索接口 + 关键词表（中英文），按规则打分过滤，结合你的 ♥ 口味加权。
+2. **听歌分析**：在浏览器里解码音频片段，用起音自相关测 BPM 和拍点相位，并测响度和能量。
+3. **排歌单**：按能量曲线排序，尽量让相邻曲目的 BPM 接近、调性在 Camelot 轮上相容。
+4. **混音转场**：两个 Deck 各有 EQ、滤波、延迟、混响、镶边、相位等节点，转场按拍点精确调度。
+5. **实时 ride**：每个 16 拍乐句最多一个动作，界面上的旋钮直接读取真实的音频参数。
+6. **动态转向**：换风格后在后台重新挖歌，加入过渡曲，并重新排列后面的歌单。
 
-## Honest limits
-- Music = whatever independent artists uploaded to Audius; quality varies and the catalogue is not the
-  commercial charts. Audius can rate-limit (HTTP 429) if you rebuild many times in a row.
-- Beat grids are estimates: tempo is usually right (Audius BPM + our check), but bar/phrase alignment
-  (which beat is "1") is a best guess, so some blends drift or land off-phrase.
-- Loops are delay-line "slip loops" (the track keeps running underneath), the standard approach for
-  streamed audio.
-- iTunes fallback = 30 s previews only, tempo estimated in-browser, short crossfades.
-- Chinese platforms: unofficial web endpoints that can change or rate-limit without notice; search relevance is
-  looser (pop remixes tagged "DJ" turn up), and no BPM/key metadata. Use is subject to each platform's terms —
-  Muse only plays what they stream for free to anonymous listeners.
+## 本地运行
+
+```bash
+git clone https://github.com/novain1102/muse.git && cd muse
+python3 -m http.server 8000      # 打开 http://localhost:8000
+```
+
+也可以直接双击 `index.html`（纯静态，无需构建）。酷狗 / QQ 音乐可在 `file://` 下使用；iTunes 不支持 `file://`。
+
+## 添加音源
+
+每个音源是 `providers/` 里的一个文件，实现 `search()` 和 `getStreamUrl()`，返回统一的 Track 格式即可。详见 [providers/README.md](providers/README.md)。
+
+## 局限
+
+- Audius 是独立音乐人平台，不是商业榜单；音质和风格参差不齐，频繁生成可能被限流。
+- 拍点和乐句对齐是估算，偶尔会有转场漂移或没落在乐句上。
+- 国内平台没有 BPM / 调性数据（由浏览器自行测量），搜索结果相关性一般，可能混入"DJ 版"流行歌。
+- 网易云经代理访问时，平台按代理 IP 判断地区，海外代理只能播放部分歌曲。
+
+## 关于音源
+
+酷狗、QQ 音乐、网易云使用的都是平台的**非官方网页接口**，随时可能变动。Muse 只播放平台向匿名用户免费提供的内容：不登录、不使用 Cookie、不伪装地区、不绕过 VIP / 付费限制，也不使用任何第三方"解锁"镜像。请遵守各平台的用户协议。
+
+---
+
+更详细的英文技术说明见 [docs/DETAILS.md](docs/DETAILS.md)。
