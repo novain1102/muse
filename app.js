@@ -2,9 +2,12 @@
  * Everything here is deterministic scripting + heuristics in the browser:
  *  - crate digging: curated seed keywords per genre/mood -> music provider search (providers/) -> taste scoring
  *  - music sources are pluggable: see providers/registry.js (interface + normalized Track) and providers/README.md
- *  - sequencing: energy arc + tempo/key continuity + artist variety (local search)
- *  - analysis: onset-envelope autocorrelation for tempo/beat-phase, RMS for energy/loudness
- *  - mixing: two decks, beat-quantized scripted transitions, Web Audio FX
+ *  - sequencing: tempo ladder (×2 / ×½ / 3:2 families, ≤1.6 % steps) + set arc (reset ~45 %, gear shift ~72 %) + artist cooldown,
+ *    language spread and familiarity anchors (local search over one scoring function)
+ *  - analysis: onset-envelope autocorrelation for tempo/beat-phase, RMS for energy/loudness; full tracks also get a structure pass
+ *    (whole-song beat grid, downbeat / phrase phase, vocal activity, drumless intro, breaks, hi-hat density)
+ *  - mixing: two decks; hip-hop / 华语 sets play phrase-length excerpts and pick each transition from a deterministic decision table
+ *    (phrase cut, drop swap, bass swap, long blend, brake / echo step, ratio cut, drumless reset, echo out); Web Audio FX
  */
 'use strict';
 
@@ -168,13 +171,15 @@ function foldBpm(b, ranges = BPM_HOME) {
   if (!b || !ranges || !ranges.length) return b;
   const dist = x => Math.min(...ranges.map(([lo, hi]) => x < lo ? lo - x : x > hi ? x - hi : 0));
   let best = b; for (const c of [b / 2, b * 2]) if (dist(c) < dist(best) - 3) best = c;
+  // still outside the home range: a 3:2 reading (triplet feel) may land inside it
+  if (dist(best) > 3) for (const c of [b * 1.5, b / 1.5, b * 0.75, b / 0.75]) if (dist(c) === 0) { best = c; break; }
   return Math.round(best * 10) / 10;
 }
 /* tempo ratio allowing half/double time */
-function tempoRatio(from, to) {
+function tempoRatio(from, to, triplet = false) {   // triplet: also 3:2 / 2:3 (for planning only; beat-matching never uses it)
   if (!from || !to) return 1;
   let best = to / from;
-  for (const m of [0.5, 2]) { const r = (to * m) / from; if (Math.abs(Math.log(r)) < Math.abs(Math.log(best))) best = r; }
+  for (const m of triplet ? [0.5, 2, 1.5, 2 / 3, 0.75, 4 / 3] : [0.5, 2]) { const r = (to * m) / from; if (Math.abs(Math.log(r)) < Math.abs(Math.log(best))) best = r; }
   return best;
 }
 /* ---------- sources ----------
@@ -449,7 +454,7 @@ const decode = buf => new OfflineAudioContext(1, 22050, 22050).decodeAudioData(b
 const FULL_MAX = 480;
 async function analyzeTrack(tr) {
   if (!tr.preview && (tr.dur || 0) > 90 && (tr.dur || 0) <= FULL_MAX) {
-    try { return analyzeFull(await decode(await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 45000)), tr.bpm); }
+    try { return await analyzeFull(await decode(await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 45000)), tr.bpm); }
     catch (e) { console.info('full analysis fell back:', tr.title, e.message); }
   }
   if (!Providers.caps(tr).rangeRequests) { const a = analyzeBuffer(await decode(await fetchBytes(tr)), tr.bpm); return a; }
@@ -468,12 +473,174 @@ function sliceBuf(ab, t0, t1) {
   const L = ab.getChannelData(0).subarray(a, b), R = ab.numberOfChannels > 1 ? ab.getChannelData(1).subarray(a, b) : L;
   return { sampleRate: sr, length: b - a, numberOfChannels: 2, getChannelData: i => i ? R : L };
 }
-function analyzeFull(ab, knownBpm) {
+/* ---------- song structure (full tracks): one STFT pass -> grid, downbeat, phrases, vocals, drums, hats ----------
+ * STFT 1024 / hop 512 (22.05 kHz) pooled into 35 bands, a light harmonic / percussive split (median over time vs. over bands):
+ *  - beat grid refined over the whole song (tempo within ±1.5 %, phase) on spectral flux, so the grid does not drift
+ *  - downbeat (bar phase) from kick onsets + section novelty; phrase phase (4 half-time bars) from novelty + vocal entries
+ *  - vocal activity: harmonic energy in the ~300 Hz – 3.4 kHz band, minus the drum share of that band, plus how fast that
+ *    band's spectrum changes (voices move, loops repeat), normalised to the song itself -> first vocal entry, vocal phrase ends
+ *  - drums per bar (percussive energy + kick / hat onsets): drumless intro, breaks; hi-hat onsets per beat
+ * Generic signal heuristics only (no genre lists); every result carries a confidence and callers fall back to the plain grid. */
+const ST = { N: 1024, hop: 512 };
+let _fftT = null;
+function fftTables(N) {
+  if (_fftT && _fftT.N === N) return _fftT;
+  const rev = new Uint32Array(N), bits = Math.log2(N), cos = new Float64Array(N / 2), sin = new Float64Array(N / 2);
+  for (let i = 0; i < N; i++) { let r = 0; for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b); rev[i] = r; }
+  for (let i = 0; i < N / 2; i++) { cos[i] = Math.cos(-2 * Math.PI * i / N); sin[i] = Math.sin(-2 * Math.PI * i / N); }
+  return (_fftT = { N, rev, cos, sin });
+}
+function fft(re, im) {
+  const N = re.length, T = fftTables(N);
+  for (let i = 0; i < N; i++) { const j = T.rev[i]; if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let len = 2; len <= N; len <<= 1) {
+    const h = len >> 1, st = N / len;
+    for (let i = 0; i < N; i += len) for (let k = 0; k < h; k++) {
+      const a = i + k, b = a + h, wr = T.cos[k * st], wi = T.sin[k * st], xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+      re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+    }
+  }
+}
+const pauseSlice = () => new Promise(r => setTimeout(r, 0));
+const medianOf = (buf, n) => { for (let i = 1; i < n; i++) { const v = buf[i]; let j = i - 1; while (j >= 0 && buf[j] > v) { buf[j + 1] = buf[j]; j--; } buf[j + 1] = v; } return buf[n >> 1]; };
+const robust = a => { const s = Array.from(a).filter(Number.isFinite).sort((x, y) => x - y); if (!s.length) return { m: 0, d: 1 }; const m = s[s.length >> 1]; const dv = s.map(x => Math.abs(x - m)).sort((x, y) => x - y); return { m, d: Math.max(1e-6, 1.4826 * dv[dv.length >> 1]) }; };
+async function structureOf(ab, an) {
+  const sr = ab.sampleRate, L = ab.getChannelData(0), R = ab.numberOfChannels > 1 ? ab.getChannelData(1) : L, N = ST.N, hop = ST.hop;
+  const n = Math.max(0, Math.floor((ab.length - N) / hop) + 1), fps = sr / hop, bw = sr / N, dur = ab.length / sr;
+  if (n < fps * 30 || !an || !an.bpm) return null;
+  // 35 bands: sub, kick (64-150 Hz), 150-215 Hz, then 32 log bands to ~10.5 kHz
+  const top = Math.min(N / 2 - 1, Math.round(10500 / bw)), E = [1, 3, 7, 10];
+  for (let i = 1; i <= 32; i++) E.push(Math.max(E[E.length - 1] + 1, Math.round(10 * Math.pow(top / 10, i / 32))));
+  const NB = E.length - 1, fc = []; for (let j = 0; j < NB; j++) fc.push((E[j] + E[j + 1]) / 2 * bw);
+  const win = new Float64Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
+  const P = Array.from({ length: NB }, () => new Float32Array(n)), re = new Float64Array(N), im = new Float64Array(N);
+  for (let t = 0; t < n; t++) {
+    const o = t * hop; for (let i = 0; i < N; i++) { re[i] = (L[o + i] + R[o + i]) * 0.5 * win[i]; im[i] = 0; }
+    fft(re, im);
+    for (let j = 0; j < NB; j++) { let s = 0; for (let k = E[j]; k < E[j + 1]; k++) s += re[k] * re[k] + im[k] * im[k]; P[j][t] = s; }
+    if ((t & 2047) === 2047) await pauseSlice();
+  }
+  // harmonic (median over ~0.2 s) vs percussive (median over 5 bands) -> soft masks
+  const H = P.map(() => new Float32Array(n)), buf = new Float64Array(9);
+  for (let j = 0; j < NB; j++) { const p = P[j], h = H[j]; for (let t = 0; t < n; t++) { let c = 0; for (let u = t - 4; u <= t + 4; u++) buf[c++] = p[u < 0 ? 0 : u >= n ? n - 1 : u]; h[t] = medianOf(buf, 9); } }
+  await pauseSlice();
+  const vb = [], hb = [], sb = []; fc.forEach((f, j) => { if (f >= 300 && f <= 3400) vb.push(j); if (f >= 6000) hb.push(j); if (f >= 1000 && f < 5000) sb.push(j); });
+  const db = x => 10 * Math.log10(x + 1e-12);
+  const flux = new Float32Array(n), kickF = new Float32Array(n), snF = new Float32Array(n), hatF = new Float32Array(n);
+  const voc = new Float32Array(n), vperc = new Float32Array(n), chg = new Float32Array(n), percE = new Float32Array(n), totE = new Float32Array(n), lowE = new Float32Array(n);
+  const prevP = new Float64Array(NB), prevPd = new Float64Array(NB), hist = []; let first = true; const fb = new Float64Array(5);
+  for (let t = 0; t < n; t++) {
+    let fl = 0, sv = 0, sp = 0, pe = 0, te = 0, snf = 0, hf = 0; const hv = new Float64Array(vb.length);
+    const pm = new Float64Array(NB);
+    for (let j = 0; j < NB; j++) { let c = 0; for (let u = j - 2; u <= j + 2; u++) fb[c++] = P[u < 0 ? 0 : u >= NB ? NB - 1 : u][t]; pm[j] = medianOf(fb, 5); }
+    for (let j = 0; j < NB; j++) {
+      const p = P[j][t], h = H[j][t], q = pm[j], mH = h * h / (h * h + q * q + 1e-30), pp = p * (1 - mH), d = db(p), dp = db(pp);
+      if (!first) { fl += Math.min(20, Math.max(0, d - prevP[j])); }
+      te += p; pe += pp;
+      if (!first && j === 1) kickF[t] = Math.max(0, dp - prevPd[j]);
+      if (!first && sb.includes(j)) snf += Math.max(0, dp - prevPd[j]);
+      if (!first && hb.includes(j)) hf += Math.max(0, dp - prevPd[j]);
+      prevP[j] = d; prevPd[j] = dp;
+    }
+    vb.forEach((j, i) => { const p = P[j][t], h = H[j][t], q = pm[j], mH = h * h / (h * h + q * q + 1e-30); sv += p * mH; sp += p * (1 - mH); hv[i] = Math.sqrt(p * mH); });
+    hist.push(hv); if (hist.length > 5) hist.shift();
+    if (hist.length === 5) { const a = hist[0], b = hv; let ab_ = 0, aa = 0, bb = 0; for (let i = 0; i < b.length; i++) { ab_ += a[i] * b[i]; aa += a[i] * a[i]; bb += b[i] * b[i]; } chg[t] = 1 - ab_ / Math.sqrt(aa * bb + 1e-30); }
+    flux[t] = fl; snF[t] = snf / sb.length; hatF[t] = hf / Math.max(1, hb.length); voc[t] = db(sv); vperc[t] = db(sp); percE[t] = db(pe + P[1][t]); totE[t] = db(te); lowE[t] = db(P[0][t] + P[1][t]);
+    first = false;
+    if ((t & 4095) === 4095) await pauseSlice();
+  }
+  // ---- beat grid over the whole song: local-mean-removed flux, tempo within ±1.5 %, phase
+  const O = new Float32Array(n); { const W = Math.round(fps * 0.4); let run = 0; for (let t = 0; t < n; t++) { run += flux[t]; if (t >= W) run -= flux[t - W]; O[t] = Math.max(0, flux[t] - run / Math.min(t + 1, W)); } }
+  const Os = new Float32Array(n); for (let t = 1; t < n - 1; t++) Os[t] = 0.25 * O[t - 1] + 0.5 * O[t] + 0.25 * O[t + 1];
+  const val = x => { x *= fps; const i = x | 0, f = x - i; return i >= 0 && i + 1 < n ? Os[i] * (1 - f) + Os[i + 1] * f : 0; };
+  const gsc = (b, p) => { const B = 60 / b; let s = 0, c = 0; for (let x = p; x < dur - 0.2; x += B) { s += val(x); c++; } return c ? s / c : 0; };
+  const bestPh = (b, steps = 32) => { const B = 60 / b; let bp = 0, bs = -1; for (let k = 0; k < steps; k++) { const p = k * B / steps, s = gsc(b, p); if (s > bs) { bs = s; bp = p; } } return [bp, bs]; };
+  const bpm0 = an.bpm; let [p0, s0] = bestPh(bpm0); let G = { b: bpm0, p: p0, s: s0 };
+  for (let d = -0.015; d <= 0.01501; d += 0.0005) { const b = bpm0 * (1 + d), [p, s] = bestPh(b); if (s > G.s) G = { b, p, s }; }
+  { const B = 60 / G.b; for (let k = -8; k <= 8; k++) { const p = ((G.p + k * B / 256) % B + B) % B, s = gsc(G.b, p); if (s > G.s) G = { b: G.b, p, s }; } }
+  let meanO = 0; for (let t = 0; t < n; t++) meanO += Os[t]; meanO /= n;
+  const gridConf = G.s / (meanO + 1e-9), refined = Math.abs(G.b / bpm0 - 1) > 0.0004 && G.s > s0 * 1.03;
+  const bpm = refined ? G.b : bpm0, B = 60 / bpm, ph = refined ? G.p : (gsc(bpm0, p0) >= gsc(bpm0, an.phase || 0) ? p0 : an.phase || 0);
+  // ---- beat-level features
+  const nbt = Math.floor((dur - ph) / B); if (nbt < 32) return null;
+  const fr = x => Math.max(0, Math.min(n - 1, Math.round(x * fps)));
+  const Kb = new Float32Array(nbt), Sb = new Float32Array(nbt), Eb = new Float32Array(nbt), Lb = new Float32Array(nbt), Db = new Float32Array(nbt), Hb = new Float32Array(nbt), Vl = new Float32Array(nbt), Vp = new Float32Array(nbt), Cb = new Float32Array(nbt);
+  // hat onsets: local peaks of the hat-band percussive flux above a running median
+  const hatOn = new Uint8Array(n); { const W = Math.round(fps * 1.5); const tmp = []; for (let t = 2; t < n - 2; t++) { const v = hatF[t]; if (v <= hatF[t - 1] || v < hatF[t + 1] || v < hatF[t - 2] || v < hatF[t + 2]) continue; hatOn[t] = 1; } 
+    const all = []; for (let t = 0; t < n; t++) if (hatOn[t]) all.push(hatF[t]); all.sort((a, b) => a - b); const thr = all.length ? all[Math.floor(all.length * 0.35)] : 0; for (let t = 0; t < n; t++) if (hatOn[t] && hatF[t] < Math.max(thr, 1.5)) hatOn[t] = 0; void tmp; void W; }
+  for (let j = 0; j < nbt; j++) {
+    const t0 = ph + j * B, a = fr(t0 - 0.05), b = fr(t0 + 0.07), A = fr(t0), Z = Math.max(A + 1, fr(t0 + B));
+    let k = 0, s = 0; for (let t = a; t <= b; t++) { k = Math.max(k, kickF[t]); s = Math.max(s, snF[t]); } Kb[j] = k; Sb[j] = s;
+    let e = 0, l = 0, d = 0, h = 0, v = 0, vp = 0, c = 0; for (let t = A; t < Z; t++) { e += Math.pow(10, totE[t] / 10); l += Math.pow(10, lowE[t] / 10); d += Math.pow(10, percE[t] / 10); h += hatOn[t]; v += Math.pow(10, voc[t] / 10); vp += Math.pow(10, vperc[t] / 10); c += chg[t]; }
+    const m = Z - A; Eb[j] = db(e / m); Lb[j] = db(l / m); Db[j] = db(d / m); Hb[j] = h; Vl[j] = db(v / m); Vp[j] = db(vp / m); Cb[j] = c / m;
+  }
+  // ---- vocal score per beat (song-relative): harmonic mid level, its share over the drums in that band, spectral motion
+  const loud = Math.max(...Eb), live = Array.from(Eb, x => x > loud - 30);
+  const zf = (arr) => { const r = robust(Array.from(arr).filter((_, j) => live[j])); return Array.from(arr, x => (x - r.m) / r.d); };
+  const share = Array.from(Vl, (x, j) => x - Vp[j]), zV = zf(Vl), zS = zf(share), zC = zf(Cb);
+  const vs = Array.from(zV, (x, j) => live[j] ? 0.5 * x + 0.25 * zS[j] + 0.25 * zC[j] : -9);
+  const vsm = vs.map((x, j) => { const a = vs[j - 1] ?? x, b = vs[j + 1] ?? x; return [a, x, b].sort((p, q) => p - q)[1]; });
+  // Otsu split of the live beats -> vocal on / off; confidence from the separation and a plausible vocal share
+  const lv = vsm.filter((_, j) => live[j]); let thr = 0, conf = 0, vfrac = 0;
+  if (lv.length > 16) {
+    const lo = Math.min(...lv), hi = Math.max(...lv), K = 48, hst = new Array(K).fill(0); lv.forEach(x => hst[Math.min(K - 1, Math.floor((x - lo) / (hi - lo + 1e-9) * K))]++);
+    let best = -1, tot = lv.length, sumAll = lv.reduce((a, x) => a + x, 0), w0 = 0, s0_ = 0;
+    for (let k = 0; k < K - 1; k++) { w0 += hst[k]; s0_ += hst[k] * (lo + (k + 0.5) * (hi - lo) / K); if (!w0 || w0 === tot) continue; const m0 = s0_ / w0, m1 = (sumAll - s0_) / (tot - w0), bv = w0 * (tot - w0) * (m0 - m1) * (m0 - m1); if (bv > best) { best = bv; thr = lo + (k + 1) * (hi - lo) / K; } }
+    const on = lv.filter(x => x > thr), off = lv.filter(x => x <= thr), mean = a => a.reduce((s, x) => s + x, 0) / Math.max(1, a.length), sd = a => { const m = mean(a); return Math.sqrt(mean(a.map(x => (x - m) * (x - m)))); };
+    vfrac = on.length / lv.length; const dprime = (mean(on) - mean(off)) / (Math.sqrt((sd(on) ** 2 + sd(off) ** 2) / 2) + 1e-6);
+    conf = Math.max(0, Math.min(1, (dprime - 1.2) / 2)) * (vfrac < 0.12 || vfrac > 0.95 ? 0.3 : 1);
+  }
+  const von = vsm.map((x, j) => live[j] && x > thr);
+  for (let j = 1; j < nbt - 1; j++) if (!von[j] && von[j - 1] && von[j + 1]) von[j] = true;      // a breath between lines
+  for (let j = 1; j < nbt - 1; j++) if (von[j] && !von[j - 1] && !von[j + 1]) von[j] = false;    // a lone beat is not a line
+  // ---- downbeat: kick on the 1, section changes on the 1, snare off it
+  const nov = new Float32Array(nbt); { const fs = [Eb, Lb, Db, Float32Array.from(vsm)], sc = fs.map(f => robust(f).d);
+    for (let j = 4; j < nbt - 4; j++) { let s = 0; fs.forEach((f, i) => { let a = 0, b = 0; for (let u = 0; u < 4; u++) { a += f[j - 4 + u]; b += f[j + u]; } s += Math.abs(b - a) / 4 / sc[i]; }); nov[j] = s; } }
+  const zK = zf(Kb), zSn = zf(Sb), zN = zf(nov);
+  let off = 0, offS = -Infinity; for (let o = 0; o < 4; o++) { let s = 0; for (let j = o; j < nbt; j += 4) s += zK[j] + 1.2 * zN[j] - 0.5 * zSn[j]; if (s > offS) { offS = s; off = o; } }
+  const bar = 4 * B, down = (ph + off * B) % bar, m = bpm > 110 ? 2 : 1, hbar = bar * m, PB = 4 * m, phrase = PB * bar;
+  const j0 = Math.round((down - ph) / B), nb = Math.floor((dur - down) / bar);
+  // ---- per-bar features
+  const bars = []; for (let k = 0; k < nb; k++) { let v = 0, d = 0, kk = 0, hh = 0, lo2 = 0, e = 0, c = 0; for (let u = 0; u < 4; u++) { const j = j0 + 4 * k + u; if (j < 0 || j >= nbt) continue; v += von[j] ? 1 : 0; d += Math.pow(10, Db[j] / 10); kk += Kb[j]; hh += Hb[j]; lo2 += Math.pow(10, Lb[j] / 10); e += Math.pow(10, Eb[j] / 10); c++; }
+    c = Math.max(1, c); bars.push({ t: down + k * bar, voc: v / c, drum: db(d / c), kick: kk / c, hats: hh / c, low: db(lo2 / c), e: db(e / c), nov: nov[Math.max(0, j0 + 4 * k)] || 0 }); }
+  // phrase phase: section changes / vocal entries land on the first bar of a phrase
+  let pOff = 0, pS = -Infinity; const zNB = zf(Float32Array.from(bars.map(b => b.nov)));
+  for (let q = 0; q < PB; q++) { let s = 0; for (let k = q; k < nb; k += PB) s += zNB[k] + (bars[k].voc > 0.4 && (!bars[k - 1] || bars[k - 1].voc < 0.4) ? 0.8 : 0); if (s > pS) { pS = s; pOff = q; } }
+  const phr = (down + pOff * bar) % phrase;
+  // ---- drums: body medians, drumless intro, breaks
+  const body = bars.slice(Math.floor(nb * 0.2), Math.max(Math.floor(nb * 0.2) + 1, Math.floor(nb * 0.9)));
+  const medD = robust(body.map(b => b.drum)).m, medK = robust(body.map(b => b.kick)).m, medH = robust(body.map(b => b.hats)).m;
+  const drumOn = bars.map(b => b.drum > medD - 9 && (b.kick > 0.35 * medK || b.hats > 0.35 * medH));
+  let dk = 0; while (dk < nb - 1 && !(drumOn[dk] && drumOn[dk + 1])) dk++;
+  const drumStart = dk === 0 ? 0 : bars[dk].t, drumless = drumStart >= 4 ? drumStart : 0;
+  const brk = bars.map((b, k) => k > dk + 1 && k < nb - 2 && b.drum < medD - 12);
+  const breaks = []; for (let k = 0; k < nb; k++) if (brk[k]) { if (breaks.length && breaks[breaks.length - 1][1] === k) breaks[breaks.length - 1][1] = k + 1; else breaks.push([k, k + 1]); }
+  // ---- vocals: first entry (frame-refined) and phrase ends
+  let firstVocal = null; const vocEnds = [], vocRuns = [];
+  if (conf >= 0.2) {
+    for (let j = 0; j < nbt - 3; j++) if (von[j] && von.slice(j, j + 4).filter(Boolean).length >= 3) {
+      // first frame in the beat before / this beat whose smoothed vocal level crosses the song's on-level
+      const ref = robust(Array.from(Vl).filter((_, u) => von[u])).m, refOff = robust(Array.from(Vl).filter((_, u) => live[u] && !von[u])).m, cut = (ref + refOff) / 2;
+      let tv = ph + j * B; for (let t = fr(ph + (j - 1) * B); t < fr(ph + (j + 1) * B); t++) { let s = 0; for (let u = -2; u <= 2; u++) s += voc[Math.max(0, Math.min(n - 1, t + u))]; if (s / 5 > cut) { tv = t / fps; break; } }
+      firstVocal = Math.max(0, tv); break;
+    }
+    let st0 = -1; for (let j = 0; j <= nbt; j++) { const o = j < nbt && von[j]; if (o && st0 < 0) st0 = j; if (!o && st0 >= 0) { if (j - st0 >= 2) { vocRuns.push([ph + st0 * B, ph + j * B]); vocEnds.push(ph + j * B); } st0 = -1; } }
+  }
+  const hats = medH, lowShare = robust(body.map(b => b.low - b.e)).m;
+  return { v: 2, bpm, refined, gridConf, ph, down, bar, hbar, m, phrase, phr, nb, bars, beats: { n: nbt, von, Kb: Array.from(Kb) }, vocConf: conf, vocFrac: vfrac, firstVocal, vocEnds, vocRuns,
+    drumStart, drumless, breaks, hats, lowShare, medD };
+}
+async function analyzeFull(ab, knownBpm) {
   const dur = ab.length / ab.sampleRate, head = analyzeBuffer(sliceBuf(ab, 0, 25), knownBpm);
   if (dur > 60) { const b0 = dur * 0.4, body = analyzeBuffer(sliceBuf(ab, b0, b0 + 15), head.bpm, true); head.headDb = head.db; head.db = body.db; head.dens = body.dens; head.lowRatio = body.lowRatio; head.body = true; }
   head.prof = energyProfile(ab); head.fullDur = dur;
+  // structure pass: the grid becomes whole-song (refined tempo) and downbeat-aligned, so bars / phrases count from a real "1"
+  try { const st = await structureOf(ab, head); if (st) { head.st = st; head.bpm = st.bpm; head.phase = st.down; } }
+  catch (e) { console.info('structure analysis skipped:', e.message); }
   return head;
 }
+/* store an analysis on the track; the structure pass's refined tempo replaces the head / metadata reading */
+function applyAnalysis(t, an) { t.an = an; if (!t.bpm && an.conf > 1.15) t.bpm = an.est; if (an.st) t.bpm = Math.round(an.st.bpm * 100) / 100; }
 /* 0.1 s frames: e = level dB, lo = <150 Hz level dB (kick / 808), on = onset flux (rhythmic density) */
 function energyProfile(ab) {
   const sr = ab.sampleRate, L = ab.getChannelData(0), R = ab.numberOfChannels > 1 ? ab.getChannelData(1) : L, hop = Math.round(sr * 0.1), n = Math.floor(ab.length / hop), sub = 256;
@@ -566,70 +733,137 @@ function analyzeBuffer(ab, knownBpm, levelsOnly = false) {
   return { bpm, est, bpmSrc, conf, phase, db, lowRatio: sumLo / (sumSq + 1e-9), dens };
 }
 
-/* ---------- sequencing: warm-up -> build -> peak -> cool-down ---------- */
+/* ---------- sequencing: tempo ladder + set arc (warm-up -> build -> reset ~45 % -> peak / gear shift ~72 % -> last block) ---------- */
+/* familiarity tier from play counts, ranked within each source (counts are not comparable across catalogues); no name lists */
+function markTiers(all) {
+  const bySrc = new Map(); all.forEach(t => { const k = t.src || '?'; if (!bySrc.has(k)) bySrc.set(k, []); bySrc.get(k).push(t); });
+  const plays = t => (t.signals && t.signals.plays) || t.plays || 0;
+  bySrc.forEach(ts => {
+    const withP = ts.filter(t => plays(t) > 0), use = withP.length >= 4 && new Set(withP.map(plays)).size >= 3 ? plays : (t => t.prior || 0);
+    const s = ts.map(use).sort((a, b) => a - b);
+    ts.forEach(t => { const v = use(t); let r = 0; while (r < s.length && s[r] < v) r++; t._pct = s.length > 1 ? r / (s.length - 1) : 0.5; });
+  });
+  all.forEach(t => t._tier = t._pct >= 0.82 ? 'A' : 'B');
+}
+const grooveOf = t => { const st = stOf(t); return st ? st.hats : null; };
 function energyOf(t, norm) {
-  const bpmN = t.bpm ? clamp((Math.min(t.bpm, 180) - 75) / 100, 0, 1) : 0.5;
-  if (t.an) {
-    const dbN = clamp((t.an.db + 24) / 16, 0, 1);
-    const dN = norm ? clamp((t.an.dens - norm.dMin) / (norm.dMax - norm.dMin + 1e-9), 0, 1) : 0.5;
-    return 0.3 * dbN + 0.25 * dN + 0.2 * bpmN + 0.25 * t.prior;
+  const bpmN = t.bpm ? clamp((Math.min(t.bpm, 180) - 75) / 100, 0, 1) : 0.5, tier = t._tier === 'A' ? 1 : 0;
+  if (t.an) {   // level matters little (DJs ride the gain); groove density and familiarity shape the arc
+    const dbN = clamp((t.an.db + 24) / 16, 0, 1), g = norm && norm.useG ? grooveOf(t) : t.an.dens;
+    const lo = norm ? (norm.useG ? norm.gMin : norm.dMin) : 0, hi = norm ? (norm.useG ? norm.gMax : norm.dMax) : 1;
+    const dN = norm && g != null ? clamp((g - lo) / (hi - lo + 1e-9), 0, 1) : 0.5;
+    return 0.12 * dbN + 0.3 * dN + 0.2 * bpmN + 0.2 * (t.prior ?? 0.5) + 0.18 * tier;
   }
-  return 0.55 * t.prior + 0.45 * bpmN;
+  return 0.45 * (t.prior ?? 0.5) + 0.4 * bpmN + 0.15 * tier;
 }
 function targetCurve(x, mode) {
   if (mode === 'build') return 0.12 + 0.85 * Math.pow(x, 1.15);
   return x < 0.72 ? 0.12 + 0.88 * smooth(0, 0.72, x) : 1 - 0.42 * smooth(0.72, 1, x);  // arc
 }
-function sequence(tracks, mode, fixedHead = []) {
-  // fixedHead: tracks that must stay at the front (already playing/preloaded)
+function artistSet(t) {
+  if (t._as) return t._as; const SC = window.NEONDJ && NEONDJ.scene, a = new Set(SC && SC.artistsOf ? SC.artistsOf(t) : []);
+  if (t.artistId) a.add('id:' + t.artistId); if (!a.size && t.artist) a.add(String(t.artist).toLowerCase()); return (t._as = a);
+}
+const inWin = (x, a, b) => x >= a && x <= b;
+/* fixedHead: tracks that stay at the front (playing / cued); absStart: set index of fixedHead[0] (arc positions are time-based) */
+function sequence(tracks, mode, fixedHead = [], absStart = 0) {
   const list = tracks.slice(); if (!list.length) return fixedHead.slice();
-  const an = list.concat(fixedHead).filter(t => t.an); const norm = an.length > 2 ? { dMin: Math.min(...an.map(t => t.an.dens)), dMax: Math.max(...an.map(t => t.an.dens)) } : null;
-  list.concat(fixedHead).forEach(t => t.energy = energyOf(t, norm));
-  if (mode === 'found') return fixedHead.concat(avoidArtistRepeats(list, fixedHead[fixedHead.length - 1]));
-  // tempo outliers (>12% from the set's median, half/double aware) go to the back as spares instead of breaking the flow
+  const all = list.concat(fixedHead); markTiers(all);
+  const an = all.filter(t => t.an), withG = an.filter(t => grooveOf(t) != null), useG = withG.length >= Math.max(3, an.length * 0.6);
+  const norm = an.length > 2 ? { useG, gMin: useG ? Math.min(...withG.map(grooveOf)) : 0, gMax: useG ? Math.max(...withG.map(grooveOf)) : 1, dMin: Math.min(...an.map(t => t.an.dens)), dMax: Math.max(...an.map(t => t.an.dens)) } : null;
+  all.forEach(t => t.energy = energyOf(t, norm));
+  if (mode === 'found') return fixedHead.concat(avoidArtistRepeats(list, fixedHead));
+  // tempo outliers (>15 % from the set's median after folding ×2 / ×½ / 3:2) go to the back as spares
   let spares = [];
-  const bpms = list.concat(fixedHead).map(t => t.bpm).filter(Boolean).sort((a, b) => a - b);
+  const bpms = all.map(t => t.bpm).filter(Boolean).sort((a, b) => a - b);
   if (bpms.length >= 5) {
-    const med = bpms[Math.floor(bpms.length / 2)];
-    const out = list.filter(t => t.bpm && Math.abs(Math.log(tempoRatio(med, t.bpm))) > Math.log(1.12));
+    const med = bpms[Math.floor(bpms.length / 2)], out = list.filter(t => t.bpm && Math.abs(tempoFam(med, t.bpm).d) > Math.log(1.15));
     if (out.length && out.length <= list.length * 0.3) { spares = out; for (const t of out) list.splice(list.indexOf(t), 1); }
   }
   if (!list.length) return fixedHead.concat(spares);
-  const N = fixedHead.length + list.length; const off = fixedHead.length;
-  const targets = list.map((_, i) => targetCurve(N > 1 ? (i + off) / (N - 1) : 0, mode));
-  // initial assignment: rank-match energies to targets
-  const byE = list.slice().sort((a, b) => a.energy - b.energy);
-  const slots = targets.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
-  const seq = new Array(list.length); slots.forEach((s, k) => seq[s.i] = byE[k]);
-  const eMin = byE[0].energy, eMax = byE[byE.length - 1].energy, span = Math.max(0.05, eMax - eMin);
-  const tnorm = v => eMin + (v - 0.12) / 0.88 * span;
-  // no fixed head: anchor the opener to a low-tempo, low-energy virtual track so the set warms up from the bottom
+  const H = fixedHead.length, xs = list.map((_, i) => arcX(absStart + H + i)), targets = xs.map(x => targetCurve(x, mode));
+  // initial order: rank-match energies to the arc
+  const byE = list.slice().sort((a, b) => a.energy - b.energy), slots = targets.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+  let seq = new Array(list.length); slots.forEach((s, k) => seq[s.i] = byE[k]);
+  const eMin = byE[0].energy, span = Math.max(0.05, byE[byE.length - 1].energy - eMin);
+  // language mix (mixed-language sets only; an all-华语 / vocal-led set is not capped)
+  const zhShare = all.filter(isZh).length / all.length, mixed = zhShare >= 0.08 && zhShare <= 0.9 && fxStyle() !== 'song', gapMax = clamp(Math.round(1 / Math.max(zhShare, 0.1)) + 2, 3, 8);
+  const gs = all.map(grooveOf).filter(v => v != null), gSpan = gs.length > 1 ? Math.max(1e-6, Math.max(...gs) - Math.min(...gs)) : 1;
   const lowB = bpms.length ? bpms[Math.floor(bpms.length * 0.2)] : null;
-  const prev0 = fixedHead[fixedHead.length - 1] || (lowB ? { bpm: lowB, cam: null, artistId: null } : null);
-  const sb = shortBlend();
-  const pairCost = (a, b) => {
-    if (!a || !b) return 0;
-    let c = 0; const r = tempoRatio(a.bpm, b.bpm); c += Math.abs(Math.log(r)) * 28;   // ~1 per 3.6% jump
-    if (Math.abs(r - 1) > 0.09) c += 1.2;
-    if (sb && Math.abs(r - 1) > 0.1) c += 1.5;   // short-blend sets: past ±10% the mix can't beat-match (echo out instead)
-    c += keyDist(a.cam, b.cam) * 0.45; if (a.artistId === b.artistId) c += 6;
+  const prev0 = fixedHead[H - 1] || (lowB ? { bpm: lowB, cam: null } : null);
+  const cost = s => {
+    let c = 0, prev = prev0, zhRun = 0, sinceZh = 99, sinceA = 99, zhN = 0, zhFinal = false, prevReset = false; const seen = new Map();
+    fixedHead.forEach((t, i) => { artistSet(t).forEach(a => seen.set(a, i)); if (isZh(t)) { zhRun++; zhN++; sinceZh = 0; } else { zhRun = 0; sinceZh++; } sinceA = t._tier === 'A' ? 0 : sinceA + 1; });
+    for (let i = 0; i < s.length; i++) {
+      const t = s[i], x = xs[i], pos = H + i, st = stOf(t);
+      // tempo: ≤ 1.6 % steps free, monotonic within a block, big jumps / 3:2 only at block boundaries (reset / shift windows)
+      const f = prev && prev.bpm && t.bpm ? tempoFam(prev.bpm, t.bpm) : { d: 0, kind: '?' }, ad = Math.abs(f.d), boundary = inWin(x, 0.38, 0.5) || inWin(x, 0.66, 0.82), dir = mode === 'build' ? 1 : x < 0.72 ? 1 : -1;
+      c += (boundary ? 30 : 150) * Math.max(0, ad - 0.016);   // block boundaries may jump (masked by brake / reset / echo)
+      if (f.kind === '3:2') c += boundary ? 0.5 : 6; else if (ad > 0.03 && !boundary) c += 8;
+      if (f.kind === '1:1' && ad > 0.003 && Math.sign(f.d) === -dir) c += 1.5;
+      if (inWin(x, 0.66, 0.8) && (ad > 0.04 || f.kind === '3:2')) c -= 1;                          // the set's gear shift lands here
+      if (prev) c += 0.12 * keyDist(prev.cam, t.cam);
+      c += 8 * Math.pow((t.energy - eMin) / span - (targets[i] - 0.12) / 0.88, 2);
+      // artists: at least 4 other tracks in between, soft until 8
+      let gap = 99; artistSet(t).forEach(a => { if (seen.has(a)) gap = Math.min(gap, pos - seen.get(a)); }); c += gap < 5 ? 99 : gap < 9 ? 1 : 0;
+      // language: Chinese-language tracks single or in pairs (hard cap 3 in a row), spread out, one in the last block
+      const zh = isZh(t);
+      if (mixed) { if (zh) { c += zhRun >= 3 ? 99 : zhRun >= 2 ? 2.5 : 0; c += 6 * Math.max(0, (zhN + 1) / (pos + 1) - zhShare); if (sinceZh >= gapMax) c -= 1.5; if (x >= 0.8 && !zhFinal) c -= 1; } else if (sinceZh >= gapMax + 2) c += 0.8; }
+      // familiarity: an anchor opens the set, then about one every 8, never two within 3
+      if (t._tier === 'A') { c += sinceA < 3 ? 4 : sinceA >= 8 ? -1.5 : 0; if (pos === 0) c -= 2; if (inWin(x, 0.66, 0.8)) c -= 0.8; } else if (pos === 0) c += 0.5;
+      // mixability: clear vocal entries cut well; drumless intros are kept for the reset (~45 %) / shift (~72 %) windows
+      if (st) { c -= 0.6 * (st.firstVocal != null ? st.vocConf : 0); if (st.drumless >= 8) c += inWin(x, 0.38, 0.5) ? -2.5 : inWin(x, 0.66, 0.8) ? -1 : 1.5; }
+      if (prevReset && st && prev && grooveOf(prev) != null) c += 1.2 * Math.max(0, (grooveOf(prev) - st.hats) / gSpan);   // after a reset: harder drums
+      prevReset = !!(st && st.drumless >= 8 && inWin(x, 0.38, 0.5));
+      artistSet(t).forEach(a => seen.set(a, pos)); if (zh) { zhRun++; zhN++; sinceZh = 0; if (x >= 0.8) zhFinal = true; } else { zhRun = 0; sinceZh++; } sinceA = t._tier === 'A' ? 0 : sinceA + 1;
+      prev = t;
+    }
     return c;
   };
-  const cost = s => { let c = 0; for (let i = 0; i < s.length; i++) { c += Math.pow((s[i].energy - tnorm(targets[i])) / span, 2) * 14; c += pairCost(i ? s[i - 1] : prev0, s[i]); } return c; };
-  let cur = cost(seq);
-  for (let pass = 0; pass < 6; pass++) {
-    let improved = false;
-    for (let i = 0; i < seq.length; i++) for (let j = i + 1; j < seq.length; j++) {
-      [seq[i], seq[j]] = [seq[j], seq[i]]; const c = cost(seq);
-      if (c < cur - 1e-6) { cur = c; improved = true; } else[seq[i], seq[j]] = [seq[j], seq[i]];
+  // local search (swap / move / reverse a run) from two starts: the energy rank-match and a tempo ladder
+  // (slow → fast up to the reset, again up to the gear shift, then easing down); keep the cheaper result
+  const search = s0 => {
+    let seq = s0.slice(), cur = cost(seq);
+    for (let pass = 0; pass < 8; pass++) {
+      let improved = false;
+      for (let i = 0; i < seq.length; i++) for (let j = i + 1; j < seq.length; j++) {
+        [seq[i], seq[j]] = [seq[j], seq[i]]; const c = cost(seq);
+        if (c < cur - 1e-6) { cur = c; improved = true; } else[seq[i], seq[j]] = [seq[j], seq[i]];
+      }
+      for (let i = 0; i < seq.length; i++) for (let j = 0; j < seq.length; j++) {   // move one track elsewhere (ladders need shifts, not swaps)
+        if (i === j) continue; const s2 = seq.slice(); const [t] = s2.splice(i, 1); s2.splice(j, 0, t); const c = cost(s2);
+        if (c < cur - 1e-6) { cur = c; seq = s2; improved = true; }
+      }
+      for (let i = 0; i < seq.length - 2; i++) for (let j = i + 2; j < Math.min(seq.length, i + 12); j++) {   // reverse a run (turns a falling ladder into a rising one)
+        const s2 = seq.slice(0, i).concat(seq.slice(i, j + 1).reverse(), seq.slice(j + 1)); const c = cost(s2);
+        if (c < cur - 1e-6) { cur = c; seq = s2; improved = true; }
+      }
+      if (!improved) break;
     }
-    if (!improved) break;
-  }
+    return { seq, cur };
+  };
+  const ladder = (() => {
+    const sb = list.slice().sort((a, b) => (a.bpm || 0) - (b.bpm || 0)), n = sb.length, cut = xs.findIndex(x => x >= 0.45), k1 = cut > 0 ? cut : Math.round(n * 0.45);
+    const lo = [], hi = []; sb.forEach((t, i) => (i % 2 ? hi : lo).push(t));   // two interleaved ramps covering the same tempo range
+    const first = lo.slice(0, k1), rest = lo.slice(k1).concat(hi).sort((a, b) => (a.bpm || 0) - (b.bpm || 0));
+    const peak = Math.max(0, Math.round(rest.length * 0.75)), up = rest.filter((_, i) => i % 4 !== 3), down = rest.filter((_, i) => i % 4 === 3).reverse();
+    return first.concat(up, down).slice(0, n).concat(sb.filter(t => !first.includes(t) && !up.includes(t) && !down.includes(t)));
+  })();
+  let best = search(seq); const alt = search(ladder); if (alt.cur < best.cur) best = alt;
+  seq = best.seq;
+  // slot roles for the transition planner: the reset (drumless intro in the 38–50 % window) and the gear shift (biggest step, 66–80 %)
+  list.forEach(t => { t._slot = null; }); let resetDone = false, shift = null;
+  seq.forEach((t, i) => { const x = xs[i], st = stOf(t); t._x = +x.toFixed(3);
+    if (!resetDone && st && st.drumless >= 8 && inWin(x, 0.38, 0.5)) { t._slot = 'reset'; resetDone = true; }
+    const p = i ? seq[i - 1] : fixedHead[H - 1]; if (p && inWin(x, 0.66, 0.8)) { const f = tempoFam(p.bpm, t.bpm), m = f.kind === '3:2' ? 1 : Math.abs(f.d); if (!shift || m > shift.m) shift = { t, m }; } });
+  if (shift && shift.m > 0.03 && !shift.t._slot) shift.t._slot = 'shift';
   return fixedHead.concat(seq, spares);
 }
-function avoidArtistRepeats(list, prev) {
-  const out = list.slice();
-  for (let i = 0; i < out.length; i++) { const p = i ? out[i - 1] : prev; if (p && out[i].artistId === p.artistId) { const j = out.findIndex((t, k) => k > i && t.artistId !== p.artistId); if (j > 0) [out[i], out[j]] = [out[j], out[i]]; } }
+/* 'found' order: keep it, but push a track back when its artist played within the last 4 */
+function avoidArtistRepeats(list, prev = []) {
+  const out = list.slice(), head = Array.isArray(prev) ? prev : prev ? [prev] : [];
+  const clash = (t, i) => { for (let k = 1; k <= 4; k++) { const p = i - k >= 0 ? out[i - k] : head[head.length - (k - i)]; if (p && [...artistSet(t)].some(a => artistSet(p).has(a))) return true; } return false; };
+  for (let i = 0; i < out.length; i++) if (clash(out[i], i)) { const j = out.findIndex((t, k) => k > i && !clash(t, i)); if (j > 0) { const [t] = out.splice(j, 1); out.splice(i, 0, t); } }
   return out;
 }
 /* ---------- audio engine ---------- */
@@ -739,13 +973,16 @@ class Deck {
   }
   load(track, startAt = 0, resolved = false) {
     if (!resolved && Providers.needsResolve(track)) return Providers.prepare(track).then(() => this.load(track, startAt, true));   // signed / expiring URLs
+    if (this._abort) this._abort();   // a newer load supersedes a pending one (its stale listeners must not seek this deck later)
     this.track = track; this.ready = false; this.startAt = startAt; this.sec = null; this._perfFor = -1;
-    this.el.preservesPitch = true; this.el.playbackRate = 1;
+    this.el.preservesPitch = true; this.el.playbackRate = 1; this.lockRate = 1;   // lockRate: the block tempo this deck holds (tick glides toward it)
     return new Promise((resolve, reject) => {
       const el = this.el; let done = false;
-      const fin = (ok, err) => { if (done) return; done = true; clearTimeout(to); el.removeEventListener('canplay', onCan); el.removeEventListener('error', onErr); el.removeEventListener('loadedmetadata', onMeta); ok ? resolve() : reject(err); };
-      const onMeta = () => { if (isFinite(el.duration) && el.duration > 1) track.dur = el.duration; if (startAt > 0 && startAt < track.dur - 5) el.currentTime = startAt; };
-      const onCan = () => { if (startAt > 0 && Math.abs(el.currentTime - startAt) > 1 && startAt < track.dur - 5) { el.currentTime = startAt; return; } this.ready = true; fin(true); };
+      const fin = (ok, err) => { if (done) return; done = true; if (this._abort === abort) this._abort = null; clearTimeout(to); el.removeEventListener('canplay', onCan); el.removeEventListener('error', onErr); el.removeEventListener('loadedmetadata', onMeta); ok ? resolve() : reject(err); };
+      const abort = () => fin(true); this._abort = abort;
+      // this.startAt (not the argument): the planner may re-cue the deck while it is still loading
+      const onMeta = () => { if (isFinite(el.duration) && el.duration > 1) track.dur = el.duration; const sa = this.startAt; if (sa > 0 && sa < track.dur - 5) el.currentTime = sa; };
+      const onCan = () => { const sa = this.startAt; if (sa > 0 && Math.abs(el.currentTime - sa) > 1 && sa < track.dur - 5) { el.currentTime = sa; return; } this.ready = true; fin(true); };
       const onErr = () => fin(false, new Error('media error ' + (el.error && el.error.code)));
       const to = setTimeout(() => fin(false, new Error('load timeout')), 20000);
       el.addEventListener('loadedmetadata', onMeta); el.addEventListener('canplay', onCan); el.addEventListener('error', onErr);
@@ -839,7 +1076,6 @@ const S = { set: [], idx: -1, decks: [], live: null, playing: false, paused: fal
   lastScript: '', perfLog: [], plan: null, lastFlourish: -1, lastRiser: -1, buildId: 0, params: null, extending: false, braking: false, preloading: null };
 const opt = id => $('#' + id);
 const xfLen = () => +opt('xfLen').value;
-const perTrack = () => +opt('perTrack').value;
 const fxAmt = () => ({ smooth: 0.1, club: 0.25, wild: 0.42 })[opt('fxAmt').value] || 0.25;   // the Hype select (Smooth / Club / Wild)
 const isChillSet = () => { const p = S.params || {}; return (p.moods || []).some(m => m === 'chill' || m === 'dreamy') || (p.genres || []).some(g => g === 'lofi' || g === 'downtempo'); };
 
@@ -854,23 +1090,166 @@ function ensureAudio() {
 }
 const other = d => S.decks[0] === d ? S.decks[1] : S.decks[0];
 
+/* ---------- phrase-based mix planning (deterministic: every choice comes from the two tracks' measured structure) ----------
+ * Play length: no fixed minimum. A track plays a whole number of phrases from its cue (usually 12–24 half-time bars,
+ * ≈ 40–80 s; 16 by default), longer in the last block of the set; the cut lands on a phrase end or where A's vocal line ends,
+ * never inside a highlight / drop. B comes in on the downbeat a beat to a bar before its first vocal line (or on its drop / hook);
+ * it starts from its intro only when that intro is musically useful (a drumless intro used as a reset, a long blend).
+ * The transition type comes from a decision table over tempo relation, key, vocals, drums / breaks and set position. */
+const EST_PLAY = 56;                                           // typical seconds per track mid-set (≈ 16 half-time bars)
+const setLenSec = () => (+opt('setLen').value || 30) * 60;
+const fullSongs = () => opt('perTrack').value === '0';
+const stOf = t => (t && !t.preview && t.an && t.an.st) || null;
+const isZh = t => /[\u3400-\u9fff]/.test(`${t.title || ''} ${t.artist || ''}`);
+/* arc position 0..1 of set slot j: real played time before the current track + typical lengths after it (laps in endless) */
+function arcX(j) {
+  const T = setLenSec(), cur = Math.max(0, S.idx);
+  let t = S.playing && S.idx >= 0 ? (S.playedSec || 0) + (j - cur) * EST_PLAY : j * EST_PLAY; t = Math.max(0, t);
+  const x = t / T; return x <= 1 ? x : opt('endless').checked ? x % 1 : 1;
+}
+/* tempo family incl. 3:2 — d: signed log ratio of b against a after folding (×2, ×½; 3:2 kinds: ×1.5, ×⅔, ×¾, ×4/3) */
+function tempoFam(a, b) {
+  if (!a || !b) return { d: 0, kind: '?', m: 1 };
+  let best = { d: Math.log(b / a), kind: '1:1', m: 1 };
+  for (const m of [2, 0.5]) { const d = Math.log(b * m / a); if (Math.abs(d) < Math.abs(best.d)) best = { d, kind: '1:1', m }; }
+  if (Math.abs(best.d) > 0.016) for (const m of [1.5, 2 / 3, 3, 1 / 3]) { const d = Math.log(b * m / a); if (Math.abs(d) < Math.abs(best.d) - 0.004) best = { d, kind: '3:2', m }; }
+  return best;
+}
+const barIdx = (st, t) => Math.floor((t - st.down) / st.bar + 1e-6);
+const barT = (st, k) => st.down + k * st.bar;
+const onPhrase = (st, t) => { const q = (t - st.phr) / st.phrase; return Math.abs(q - Math.round(q)) * st.phrase < 0.04; };
+/* fraction of beats in [a, b) with vocals (null: unknown) */
+function vocalIn(st, a, b) {
+  if (!st || st.vocConf < 0.2) return null; const B = 60 / st.bpm, V = st.beats.von;
+  let n = 0, v = 0; for (let j = Math.max(0, Math.floor((a - st.ph) / B + 1e-6)); j < Math.min(V.length, Math.ceil((b - st.ph) / B - 1e-6)); j++) { n++; if (V[j]) v++; }
+  return n ? v / n : 0;
+}
+const heavyLow = st => !!st && st.lowShare > -1.5;   // 808 / kick carries most of the level (corpus: -4.5..-0.5 dB, top third)
+/* B's cue (track seconds) — kind: 'vocal' (default), 'drop' (first hook / drop with drums), 'intro' (drumless intro reset) */
+function cueFor(tr, kind = 'vocal') {
+  const st = stOf(tr), bs = 60 / (tr.bpm || 120), dur = tr.dur || 180;
+  if (!st) {   // no structure: the old skip-intro guess on the 16-beat grid
+    const ph = (tr.an && tr.an.phase) || 0, target = opt('skipIntro').checked ? Math.min(dur * 0.1, 32) : 0;
+    return { t: Math.max(0, ph + Math.max(0, Math.round((target - ph) / bs / 16) * 16) * bs), kind: 'grid', conf: 0 };
+  }
+  const B = 60 / st.bpm, bar = st.bar;
+  if (kind === 'intro' && st.drumless >= 8) {   // a phrase or two of the drumless intro before the drums land (or from the top)
+    const n = Math.min(2, Math.floor(st.drumStart / st.phrase + 1e-6)), t = st.drumStart - n * st.phrase;
+    return { t: t < 1.5 ? 0 : t, kind: 'intro', conf: 1 };
+  }
+  if (kind === 'drop') {   // the first hook / drop (high-energy section with drums), not in the outro
+    const M = barMap(tr); if (M) for (const [a] of M.secs) { const t = M.t(a), k = barIdx(st, t + 0.05); if (t >= 4 && t < dur * 0.6 && st.bars[k] && st.bars[k].drum > st.medD - 6) return { t, kind: 'drop', conf: 0.8 }; }
+  }
+  const tv = st.firstVocal;
+  if (tv != null && st.vocConf >= 0.2 && tv < dur * 0.45) {
+    if (tv < 0.75 * B) return { t: 0, kind: 'vocal', conf: st.vocConf, vocal: tv };
+    let t = Math.max(0, barT(st, barIdx(st, tv - 0.25 * B)));                       // the downbeat 1 beat .. 1 bar before the line
+    const q = Math.floor((tv - 0.25 * B - st.phr) / st.phrase + 1e-6), p = st.phr + q * st.phrase;
+    if (p >= 0 && tv - p <= bar + 0.25 * B + 1e-6) t = p;                             // the phrase start, when it is that close
+    return { t, kind: 'vocal', conf: st.vocConf, vocal: tv };
+  }
+  // no vocal entry found: the first phrase with drums (instrumentals start on the beat, not on a long intro)
+  const q = Math.ceil((st.drumStart - st.phr) / st.phrase - 1e-6), p = Math.max(0, st.phr + q * st.phrase);
+  return { t: p < dur * 0.4 ? p : 0, kind: 'drums', conf: 0.3 };
+}
+/* how many half-time bars this track should play (before snapping to its phrases) */
+function targetHb(tr, x, rest) {
+  let T = 16;
+  if (x >= 0.8) T += 12 * Math.min(1, (x - 0.8) / 0.2);           // the last block plays longer, track by track
+  if (rest === 1) T = Math.max(T, 28);                            // second-to-last track of a fixed-length set
+  if ((tr.energy ?? 0.5) < 0.35) T += 4;                           // sparse / R&B-leaning tracks get more room
+  return T;
+}
+/* A's out point P (track seconds, a downbeat): phrase-snapped length near the target, on a phrase end / vocal end, never
+ * inside a highlight; prefers the end of a highlight and a break right before P (a drop-swap). */
+function planOut(tr, start, x, opts = {}) {
+  if (Number.isFinite(opts.rest) && opts.rest <= 4) x = Math.max(x, 1 - 0.05 * opts.rest);   // fixed-length set: the last four tracks are the closing block
+  const st = stOf(tr), M = barMap(tr), dur = tr.dur || 180, now = opts.now ?? start, cap = dur - (opts.tail ?? 4);
+  if (!st) return null;
+  const hb = st.hbar, bar = st.bar, B = 60 / st.bpm, T = targetHb(tr, x, opts.rest), Lmin = 12, Lmax = x >= 0.8 ? 40 : 24;
+  const hiAt = k => !!(M && k >= 0 && k < M.nb && M.hi[k]);
+  const cands = [];
+  for (let k = barIdx(st, start + Lmin * hb - 0.05) + 1; ; k++) {
+    const P = barT(st, k), L = (P - start) / hb; if (P > cap || L > Lmax + 0.01) break; if (P < now + (opts.lead ?? 2)) continue;
+    const through = hiAt(k - 1) && hiAt(k), after = hiAt(k - 1) && !hiAt(k), before = !hiAt(k - 1) && hiAt(k);
+    const vEnd = st.vocConf >= 0.2 && st.vocEnds.some(e => e >= P - bar - 0.3 * B && e <= P + 0.3 * B);
+    const vThru = (vocalIn(st, P - B, P) || 0) > 0.5 && (vocalIn(st, P, P + B) || 0) > 0.5;
+    const brk = st.breaks.some(([a, b]) => b === k && b - a <= 4), phr = onPhrase(st, P), el = Math.abs(L / 4 - Math.round(L / 4)) < 0.02;
+    let s = -0.6 * Math.pow((L - T) / 4, 2) + (phr ? 2 : 0) + (el ? 0.5 : 0) + (vEnd ? 1.5 : 0) - (vThru ? 1.5 : 0) + (after ? 1 : 0) + (brk ? 1.2 : 0) - (before ? 0.5 : 0);
+    if (st.bpm > 110 && Math.abs(L - Math.round(L)) > 0.01) s -= 1;   // mid half-time bar
+    cands.push({ P, k, L, s, through, phr, vEnd, vThru, after, brk });
+  }
+  const ok = cands.filter(c => !c.through);
+  if (ok.length) { const b = ok.reduce((a, c) => c.s > a.s + 1e-9 ? c : a); return { ...b, reason: b.brk ? 'break' : b.after ? 'after-highlight' : b.vEnd ? 'vocal-end' : b.phr ? 'phrase' : 'bar', map: true, target: T }; }
+  // everything in range sits inside a highlight: hold until it ends, else let the song play out
+  for (let k = barIdx(st, start + Lmax * hb) + 1; barT(st, k) <= cap; k++) if (!(hiAt(k - 1) && hiAt(k))) return { P: barT(st, k), k, L: (barT(st, k) - start) / hb, reason: 'held-past-highlight', map: true, target: T };
+  return { P: Math.max(start + 8, cap), L: (cap - start) / hb, reason: 'played-out', map: true, target: T };
+}
+/* script timing: lead = beats of A before the 1 where automation starts; pre = B beats rolled before the 1 (silent for cuts) */
+const MIXT = {
+  phraseCut: { lead: 1, pre: 2 }, dropSwap: { lead: 0.5, pre: 2 }, ratioCut: { lead: 1, pre: 2 }, bassSwap: { lead: 4, pre: 4 },
+  longBlend: { lead: 'n', pre: 'n' }, brake: { lead: 1.5, pre: 2 }, tempoMask: { lead: 2, pre: 2 }, drumlessReset: { lead: 1, pre: 2 }, echoOut: { lead: 4, pre: 2 },
+};
+/* the decision table: A playing at rateA, out at P (track seconds) -> how B comes in */
+function decideMix(A, rateA, P, Bt, info = {}) {
+  const sa = stOf(A), sb = stOf(Bt), aT = (A.bpm || 120) * rateA, bpmB = Bt.bpm || 120;
+  const fam = tempoFam(aT, bpmB), gap = Math.abs(Math.exp(-fam.d) - 1), grid = beatOk(A) && beatOk(Bt), canSync = opt('tempoSync').checked && grid && fam.kind === '1:1';
+  const keyOk = !!(A.cam && Bt.cam && keyDist(A.cam, Bt.cam) <= 0.6);
+  const Ba = 60 / aT, Bb = 60 / bpmB, cueV = cueFor(Bt, 'vocal');
+  const vA = x => sa ? vocalIn(sa, x[0], x[1]) : null;
+  let type, why = [], cue = cueV, rateB = 1, lockB = 1, n = 0;
+  const sync = canSync && gap <= 0.025;                               // stretch ≤ 2.5 %: B joins the block tempo
+  const rSync = sync ? Math.exp(-fam.d) : 1;
+  const aBreak = !!(sa && sa.breaks.some(([a, b]) => b === barIdx(sa, P + 0.05) && b - a <= 4));
+  const aVocThru = (vA([P - Ba, P]) || 0) > 0.5;
+  const bPreFree = sb && cueV.t >= 4 * Bb ? (vocalIn(sb, cueV.t - 4 * Bb, cueV.t) ?? 1) <= 0.25 : false;
+  if (info.reset && sb && sb.drumless >= 8) { type = 'drumlessReset'; why.push(`reset slot, ${Math.round(sb.drumless)} s drumless intro`); }
+  else if (sync) {
+    const drop = cueFor(Bt, 'drop');
+    const nb = sa ? 4 * sa.hbar / Ba : 16, bInst = sb ? cueV.t - nb * Bb >= 0 && (vocalIn(sb, cueV.t - nb * Bb, cueV.t) ?? 1) <= 0.1 : false;
+    const aInst = sa ? (vA([P - nb * Ba, P]) ?? 1) <= 0.1 || sa.breaks.some(([a, b]) => barT(sa, a) <= P - nb * Ba && barT(sa, b) >= P) : false;
+    const quota = ((S.mixN || 0) ? (S.longN || 0) / (S.mixN || 1) : 0) < 0.12 && S.lastType !== 'longBlend';
+    if (aBreak && (drop.kind === 'drop' || (sb && cueV.kind === 'vocal'))) { type = 'dropSwap'; if (drop.kind === 'drop') cue = drop; why.push('A breaks before the 1, B lands full-band'); }
+    else if (gap <= 0.016 && keyOk && aInst && bInst && quota && !info.manual) { type = 'longBlend'; n = Math.round(nb); why.push('same key, both sides instrumental'); }
+    else if (bPreFree && (aVocThru || (heavyLow(sa) && heavyLow(sb)))) { type = 'bassSwap'; why.push(aVocThru ? 'A still rapping at the 1: one bar of B tops, lows swapped on the 1' : 'two heavy 808s: lows swapped on the 1'); }
+    else { type = 'phraseCut'; why.push(sa && sa.vocConf >= 0.2 ? (aVocThru ? 'B line starts on the 1' : 'A line ends, B line starts on the 1') : 'phrase boundary'); }
+    rateB = lockB = rSync;
+  } else if (opt('tempoSync').checked && grid && fam.kind === '3:2' && Math.abs(fam.d) <= 0.01) { type = 'ratioCut'; why.push('3:2 tempo relation: straight cut, no stretch'); }
+  else if (info.lastChange) { type = 'echoOut'; why.push('final tempo change of the set'); }
+  else if (opt('tempoSync').checked && grid && fam.kind === '1:1' && gap <= 0.05) {
+    const hard = (Bt.energy ?? 0.5) >= (A.energy ?? 0.5) - 0.02 && cueV.kind === 'vocal';
+    type = hard && S.lastType !== 'brake' ? 'brake' : 'tempoMask';
+    if (type === 'tempoMask') { rateB = clamp(Math.exp(-fam.d), 0.96, 1.04); lockB = 1; }   // starts near A's tempo, glides home
+    why.push(`tempo step ${(gap * 100).toFixed(1)} %: ${type === 'brake' ? 'one-beat stop, B slams in' : 'echo throw, B glides to its own tempo'}`);
+  } else if (sb && sb.drumless >= 8) { type = 'drumlessReset'; why.push(`tempo ${(gap * 100).toFixed(0)} % away: into B's ${Math.round(sb.drumless)} s drumless intro`); }
+  else { type = 'echoOut'; why.push(grid ? `tempo ${(gap * 100).toFixed(0)} % away, no drumless intro` : 'no trustworthy beat grid'); }
+  if (type === 'drumlessReset') { cue = cueFor(Bt, 'intro'); if (canSync && gap <= 0.04) { rateB = lockB = Math.exp(-fam.d); } }
+  if (type === 'bassSwap' && !(cue.t >= 4 * Bb)) type = 'phraseCut';
+  const T = MIXT[type], lead = T.lead === 'n' ? n : T.lead, preBeats = T.pre === 'n' ? n : T.pre;
+  const preB = Math.min(cue.t, preBeats * Bb);                       // B track seconds before its cue (≥ 0)
+  return { type, why: why.join('; '), cue: cue.t, cueKind: cue.kind, cueVocal: cueV.vocal ?? null, preB, rateB, lockB, lead, n, gap: +(gap * 100).toFixed(2), fam: fam.kind, sync, next: Bt.id,
+    aVocThru, aBreak, keyOk };
+}
 function startPosFor(tr, isFirst) {
   if (tr.preview) return 0;
+  tr._pre = 0;
+  if (!isFirst && shortBlend()) {   // the planned cue minus its pre-roll (decideMix); else the vocal cue with a 2-beat pre-roll
+    const MP = S.mixPlan, p = MP && MP.pair && MP.pair.next === tr.id ? MP.pair : null; if (p) return Math.max(0, p.cue - p.preB);
+    const c = cueFor(tr, 'vocal'); return Math.max(0, c.t - Math.min(c.t, 2 * 60 / (tr.bpm || 120)));
+  }
   const bs = 60 / (tr.bpm || 120), ph = (tr.an && tr.an.phase) || 0;
   let target = 0;
   if (!isFirst && opt('skipIntro').checked) target = Math.min(tr.dur * 0.1, 32);
-  const need = (perTrack() || 180) + xfLen() + 4;
+  const need = (fullSongs() ? 180 : 70) + xfLen() + 4;
   target = Math.max(0, Math.min(target, tr.dur - need));
   const k = Math.max(0, Math.round((target - ph) / bs / 16) * 16);
-  const pos = Math.max(0, ph + k * bs);
-  // short-blend sets cue one bar early: that bar plays (lows cut) under the outgoing track, so the new phrase lands on the swap
-  tr._pre = !isFirst && shortBlend() && pos >= 4 * bs ? 4 * bs : 0;
-  return pos - tr._pre;
+  return Math.max(0, ph + k * bs);
 }
 /* rhythm-dense, vocal-led sets (hip-hop / trap, 华语 rap) mix with short beat-aligned bass swaps; club / chill keep long blends */
 const shortBlend = () => { const s = fxStyle(); return s === 'trap' || s === 'song'; };
+const GRID_CONF = 2.2;   // whole-song grid: mean flux on the beats / mean flux (structure pass)
 const BEAT_CONF = 1.3;   // onset-autocorrelation peak / mean; below this (and no metadata agreement) the grid is a guess
-const beatOk = t => !!(t && t.bpm && t.an && !t.preview && (t.an.bpmSrc === 'both' || t.an.conf >= BEAT_CONF));
+const beatOk = t => !!(t && t.bpm && t.an && !t.preview && (t.an.bpmSrc === 'both' || t.an.conf >= BEAT_CONF || (t.an.st && t.an.st.gridConf >= GRID_CONF)));
 /* mix-out point: the best phrase boundary in [lo, hi] whose overlap window [P, P + w] holds no high-energy bar. Prefers a
  * boundary right after a hook / drop ends (the highlight completed), then a calmer window, then earlier. Past hi it takes the
  * first clean boundary up to cap; with no clean one it plays out to cap (the song's end). */
@@ -900,21 +1279,39 @@ function computeTransAt() {
   const dur = tr.dur || d.el.duration || 180;
   if (tr.preview) { const end = dur - 0.6, xft = Math.min(xfLen() * rate, (end - start) * 0.4); S.transAt = Math.max(start + 8, end - xft); S.mixPlan = { id: tr.id, P: S.transAt, reason: 'preview', map: false }; return; }
   const short = shortBlend(); let w;   // w: overlap window, track seconds
-  if (short) { w = 8 * bs; S.plan = null; }
-  else {
-    w = xfLen() * rate;
-    // Hype: plan a long mashup into the next track (decided once per pair) and leave room for it
-    const H = hype(), nx = S.set[nextIdx(S.idx + 1)];
-    if (H && nx && !nx.preview && tr.bpm && nx.bpm && opt('tempoSync').checked && Math.abs(tempoRatio(nx.bpm, tr.bpm * rate) - 1) <= 0.08) {
-      const key = tr.id + '>' + nx.id; if (!S.plan || S.plan.key !== key) S.plan = { key, script: planMash(tr, nx, H) };
-      if (S.plan.script) w = Math.max(w, SCRIPTS[S.plan.script].beats(H) * bs);
-    } else S.plan = null;
+  if (short) {   // structure-aware: phrase-based length + decision table (see planOut / decideMix)
+    S.plan = null;
+    const ni = nextIdx(S.idx + 1), nx = ni >= 0 ? S.set[ni] : null, endless = opt('endless').checked, x = arcX(S.idx);
+    const rest = endless ? 99 : S.set.slice(S.idx + 1).filter(t => !t.bad).length;
+    const st = stOf(tr), cap = dur - 4;
+    let out = null;
+    if (rest === 0 || fullSongs()) {   // last track of the set (or Full): play to the outro, hand over on a clean bar
+      const M = barMap(tr); out = { P: cap, reason: 'played-out', map: !!M, L: 0 };
+      if (M) { const lo = Math.max(start + 8, cap - 32 * bs); for (let k = M.at(lo) + 1; M.t(k) <= cap; k++) if (!(M.hi[k - 1] && M.hi[k])) { out = { P: M.t(k), reason: 'outro', map: true }; } }
+    } else if (st) out = planOut(tr, start, x, { now: d.el.currentTime + 1, rest, lead: 4 * bs + 1 });
+    if (!out) {   // no structure (analysis pending / failed): the plain 16-beat grid near the typical length, around hooks
+      w = 8 * bs; const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1), lo = Math.min(start + 14 * hb, cap), hi = Math.min(start + 22 * hb, cap);
+      out = planMixOut(d, lo, hi, cap, w); out.L = (out.P - start) / hb;
+    }
+    const pair = nx ? decideMix(tr, rate, out.P, nx, { x: arcX(S.idx + 1), reset: nx._slot === 'reset', lastChange: !endless && nextIdx(ni + 1) < 0 }) : null;
+    S.mixPlan = { id: tr.id, ...out, start, x: +x.toFixed(3), short: true, holds: 0, pair };
+    const B = bs / rate, lead = pair ? Math.max(pair.lead * B, pair.preB / pair.rateB) + 0.05 : 4 * B;
+    S.transAt = Math.max(start + 4, out.P - (lead + 0.6) * rate);
+    // the next deck is already cued: move it to the planned pre-roll point now (not at the last moment)
+    const o = other(d); if (pair && o.track === nx && o.el.paused && !S.inTrans) { const want = Math.max(0, pair.cue - pair.preB); o.startAt = want; if (o.ready && Math.abs(o.el.currentTime - want) > 0.05) o.el.currentTime = want; }
+    return;
   }
-  const cap = dur - w - 0.6, pt = perTrack();
+  w = xfLen() * rate;
+  // Hype: plan a long mashup into the next track (decided once per pair) and leave room for it
+  const H = hype(), nx = S.set[nextIdx(S.idx + 1)];
+  if (H && nx && !nx.preview && tr.bpm && nx.bpm && opt('tempoSync').checked && Math.abs(tempoRatio(nx.bpm, tr.bpm * rate) - 1) <= 0.04) {
+    const key = tr.id + '>' + nx.id; if (!S.plan || S.plan.key !== key) S.plan = { key, script: planMash(tr, nx, H) };
+    if (S.plan.script) w = Math.max(w, SCRIPTS[S.plan.script].beats(H) * bs);
+  } else S.plan = null;
+  const cap = dur - w - 0.6;
   let lo, hi;
-  if (pt <= 0) { lo = cap - 32 * bs; hi = cap; }                                         // Full: play to the outro
-  else if (short) { lo = start + Math.max(pt, 150, 0.65 * dur); hi = Math.max(lo + 32 * bs, start + 0.82 * dur); }   // most of the song
-  else { lo = start + pt - w; hi = lo + 64 * bs; }                                         // club: per-track length, may hold 16 bars for a drop
+  if (fullSongs()) { lo = cap - 32 * bs; hi = cap; }                                         // Full: play to the outro
+  else { const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1); lo = start + 16 * hb - w; hi = lo + 64 * bs; }   // club: phrase-based (16 half-time bars), may hold 16 bars for a drop
   lo = Math.min(lo, cap);
   const m = planMixOut(d, lo, hi, cap, w);
   S.mixPlan = { id: tr.id, ...m, lo, hi, cap, w, short, holds: 0 };
@@ -945,7 +1342,7 @@ async function playFrom(i) {
   setStatus(`Loading “${tr.title}”…`, 'busy');
   try { await d.load(tr, startPosFor(tr, true)); }
   catch (e) { tr.bad = true; renderList(); const n = nextIdx(i + 1); if (n >= 0) return playFrom(n); setStatus('Could not load any track', 'err'); return; }
-  S.live = d; applyAutoGain(d);
+  S.live = d; d.lockRate = 1; applyAutoGain(d); S.liveSince = ctx.currentTime;
   const t = ctx.currentTime + 0.05;
   await d.el.play().catch(e => console.warn(e));
   S.playing = true; S.paused = false; document.body.classList.add('playing');
@@ -964,26 +1361,16 @@ function planMash(a, b, H) {
   return pick(['mashup', 'mashloop']);
 }
 function chooseScript(D, I, synced) {
-  if (shortBlend()) {   // short blends: beat-aligned bass swap, else echo out + new track on its downbeat; a cut only into a clear lift
-    const H = hype() || HYPE.club, dE = (I.track.energy ?? .5) - (D.track.energy ?? .5), fx = opt('autoFx').checked && fxAmt() >= 0.15;
-    const cutOk = fx && dE > 0.15 && ctx.currentTime - (S.lastCut || -1e9) > H.cutGap && rng() < 0.3;
-    if (cutOk) { S.lastCut = ctx.currentTime; return synced ? 'roll' : 'brake'; }
-    return synced ? 'swap' : opt('autoFx').checked ? 'echoOut' : 'quick';
-  }
+  // previews in a hip-hop / 华语 set (full tracks go through decideMix): short bass swap, else echo out
+  if (shortBlend()) return synced ? 'swap' : opt('autoFx').checked ? 'echoOut' : 'quick';
+  // club / chill: deterministic from the pair (sync, key, energy step) — the music is the reason, no random picks
   if (!opt('autoFx').checked) return 'fade';
-  const dE = (I.track.energy ?? .5) - (D.track.energy ?? .5);
-  const pos = S.set.length > 1 ? S.idx / (S.set.length - 1) : 0;
-  // the mix itself is the reason; glitchy scripts (roll / stutter / tape stop) only into a clear energy lift, in club or trap
-  // sets, and at most once per cut cooldown (shared with the mid-track moves)
-  const chill = isChillSet(), style = fxStyle(), H = hype() || HYPE.club, cutOk = (style === 'club' || style === 'trap') && ctx.currentTime - (S.lastCut || -1e9) > H.cutGap; let c;
-  if (!synced) c = chill || style === 'song' ? ['wash', 'echo', 'wash'] : ['echo', 'echo', 'wash'].concat(cutOk && dE > 0.12 ? ['brake'] : []);
-  else if (chill) c = ['wash', 'filter', 'blend', 'phase', 'blend'];
-  else if (dE > 0.12) c = ['filter', 'echo', 'blend'].concat(cutOk ? ['roll'] : []);
-  else if (dE < -0.15) c = ['wash', 'echo', 'filter'];
-  else c = ['blend', 'filter', 'blend', 'echo'].concat(style === 'club' ? ['phase', 'flange'] : []);
-  if (fxAmt() < 0.15) c = c.filter(x => !['roll', 'stutter', 'brake', 'flange'].includes(x)).concat(['blend']);
-  const opts = c.filter(x => x !== S.lastScript), k = opts.length ? pick(opts) : c[0];
-  if (['roll', 'stutter', 'brake'].includes(k)) S.lastCut = ctx.currentTime; return k;
+  const dE = (I.track.energy ?? .5) - (D.track.energy ?? .5), keyOk = !!(D.track.cam && I.track.cam && keyDist(D.track.cam, I.track.cam) <= 0.6), chill = isChillSet();
+  if (!synced) return chill || fxStyle() === 'song' ? 'wash' : 'echo';
+  if (chill) return keyOk ? 'blend' : 'wash';
+  if (dE > 0.12) return 'filter';
+  if (dE < -0.15) return 'wash';
+  return keyOk ? 'blend' : 'filter';
 }
 
 /* scripted transitions: (D)eck out, (I)ncoming, T start, B beat seconds, n beats -> {inAt, end} */
@@ -1099,13 +1486,62 @@ const SCRIPTS = {
     D.xf.gain.setValueAtTime(1, T1 - 4 * B); curve(D.xf.gain, 1, 0, T1 - 4 * B, T1); D.rSend.gain.setValueAtTime(D.knob.reverb * 0.9, T1 - 4 * B); lin(D.rSend.gain, 0.5, T1);
     I.mid.gain.setValueAtTime(-7, T1 - 4 * B); lin(I.mid.gain, I.knob.mid, T1);
     return { inAt: T, end: T1 }; } },
-  brake: { label: 'TAPE STOP', n: 4, fn(D, I, T, B, n) {
-    const T1 = T + n * B, bt = T1 - 2 * B;
-    S.braking = true; D.brake(bt, 2 * B); showFx('TAPE STOP', bt, false, 2 * B, D.name);
-    D.xf.gain.setValueAtTime(1, T); D.xf.gain.setValueAtTime(1, T1 - 0.06); lin(D.xf.gain, 0, T1);
-    D.rSend.gain.setValueAtTime(D.knob.reverb * 0.9, bt); lin(D.rSend.gain, 0.5, T1);
-    I.xf.gain.setValueAtTime(0, T); I.xf.gain.setValueAtTime(0, T1 - 0.004); lin(I.xf.gain, 1, T1 + 0.004); Master.impact(T1, 0.8); showFx('IMPACT', T1, false, 0.7);
-    return { inAt: T1, end: T1 }; } },
+  /* ---- structure-aware transitions (hip-hop / 华语 sets): fn(D, I, T, B, plan) with T = the 1 (B's cue lands here) ---- */
+  /* phrase cut: A's kick / 808 out a beat before the 1, B in on the 1, at most half a beat of A's tail */
+  phraseCut: { label: 'PHRASE CUT', fn(D, I, T, B) {
+    D.low.gain.setValueAtTime(D.knob.low, T - B); lin(D.low.gain, -30, T - B + 0.03);
+    D.xf.gain.setValueAtTime(1, T - 0.004); curve(D.xf.gain, 1, 0, T - 0.004, T + 0.5 * B, 'eqp');
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + 0.5 * B + 0.02 }; } },
+  /* drop swap: A plays its own break, B's drop / hook lands full-band on the 1 */
+  dropSwap: { label: 'DROP SWAP', fn(D, I, T) {
+    D.xf.gain.setValueAtTime(1, T - 0.012); lin(D.xf.gain, 0, T);
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + 0.03 }; } },
+  /* 3:2 / 2:1 relation: no stretch, a clean cut on the 1 */
+  ratioCut: { label: 'RATIO CUT', fn(D, I, T, B) {
+    D.low.gain.setValueAtTime(D.knob.low, T - B); lin(D.low.gain, -30, T - B + 0.03);
+    D.xf.gain.setValueAtTime(1, T - 0.012); lin(D.xf.gain, 0, T);
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + 0.03 }; } },
+  /* short bass swap: one bar of B's tops (no vocal, high-passed) under A, lows handed over on the 1, A gone within a beat */
+  bassSwap: { label: 'BASS SWAP', fn(D, I, T, B) {
+    const T0 = T - 4 * B, fI = filterFreqs(I.knob.filter), fD = filterFreqs(D.knob.filter);
+    curve(I.xf.gain, 0, 0.85, T0, T, 'eqp'); I.xf.gain.setValueAtTime(0.85, T); lin(I.xf.gain, 1, T + B);
+    I.low.gain.setValueAtTime(-32, T0); I.low.gain.setValueAtTime(-32, T - 0.025); lin(I.low.gain, I.knob.low, T + 0.01);
+    I.hp.frequency.setValueAtTime(190, T0); I.hp.frequency.setValueAtTime(190, T - 0.025); expo(I.hp.frequency, Math.max(10, fI.hp), T + 0.015);
+    D.xf.gain.setValueAtTime(1, T); curve(D.xf.gain, 1, 0, T, T + B, 'eqp');
+    D.low.gain.setValueAtTime(D.knob.low, T - 0.025); lin(D.low.gain, -32, T + 0.01);
+    D.hp.frequency.setValueAtTime(Math.max(10, fD.hp), T - 0.025); expo(D.hp.frequency, 260, T + 0.015); expo(D.hp.frequency, 700, T + B);
+    showFx('BASS SWAP', T - B / 2, false, B, D.name + '→' + I.name);
+    return { end: T + B + 0.02 }; } },
+  /* long blend (same key, instrumental on both sides): B's intro under A's instrumental phrase, lows swapped half-way */
+  longBlend: { label: 'LONG BLEND', fn(D, I, T, B, p) {
+    const n = p.n, T0 = T - n * B, mid = T0 + Math.round(n / 8) * 4 * B;
+    curve(I.xf.gain, 0, 1, T0, mid, 'eqp'); D.xf.gain.setValueAtTime(1, T0); D.xf.gain.setValueAtTime(1, mid); curve(D.xf.gain, 1, 0, mid, T, 'eqp');
+    I.low.gain.setValueAtTime(-26, T0); I.low.gain.setValueAtTime(-26, mid - 0.025); lin(I.low.gain, I.knob.low, mid + 0.01);
+    D.low.gain.setValueAtTime(D.knob.low, mid - 0.025); lin(D.low.gain, -26, mid + 0.01);
+    const q = T - 4 * B; D.hp.frequency.setValueAtTime(filterFreqs(D.knob.filter).hp, q); expo(D.hp.frequency, 380, T);
+    showFx('BASS SWAP', mid - B, false, 2 * B, D.name + '→' + I.name);
+    return { end: T + 0.02 }; } },
+  /* tempo step (brake): A stops in one beat, B slams in on the 1 at its own tempo */
+  brake: { label: 'BRAKE', fn(D, I, T, B) {
+    S.braking = true; D.brake(T - B, B * 0.95); showFx('TAPE STOP', T - B, false, B, D.name);
+    D.xf.gain.setValueAtTime(1, T - 0.04); lin(D.xf.gain, 0, T);
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + 0.03 }; } },
+  /* tempo step (mask): an echo throw on A's last beat covers the step; B starts near A's tempo and glides to its own */
+  tempoMask: { label: 'ECHO STEP', fn(D, I, T, B) {
+    D.echo(T - B, 0.5, 0.42, 0.5); D.hp.frequency.setValueAtTime(Math.max(10, filterFreqs(D.knob.filter).hp), T - 2 * B); expo(D.hp.frequency, 520, T);
+    D.xf.gain.setValueAtTime(1, T - 0.012); lin(D.xf.gain, 0, T); showFx('ECHO THROW', T - B, false, B, D.name);
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + 0.03 }; } },
+  /* drumless reset: A leaves on its phrase end with a short echo, B's drumless intro takes over (the drums arrive in B's tempo) */
+  drumlessReset: { label: 'DRUMLESS RESET', fn(D, I, T, B) {
+    D.echo(T - B / 2, 0.45, 0.4, 0.5); D.xf.gain.setValueAtTime(1, T - 0.004); curve(D.xf.gain, 1, 0, T - 0.004, T + B, 'eqp');
+    D.hp.frequency.setValueAtTime(Math.max(10, filterFreqs(D.knob.filter).hp), T); expo(D.hp.frequency, 600, T + B);
+    I.xf.gain.setValueAtTime(0, T - 0.004); lin(I.xf.gain, 1, T + 0.004);
+    return { end: T + B + 0.02 }; } },
 };
 
 async function transition(kind = 'auto', toIdx = null, forceScript = null) {
@@ -1120,14 +1556,15 @@ async function transition(kind = 'auto', toIdx = null, forceScript = null) {
     catch (e) { S.preloading = null; tr.bad = true; renderList(); S.inTrans = false; const n = nextIdx(to + 1); if (n >= 0 && kind === 'auto') return transition(kind, n); return; }
   }
   if (!S.playing || S.paused) { S.inTrans = false; return; }
-  // tempo sync: match incoming to outgoing (allowing half/double time) if within ±8%
+  if (shortBlend() && !tr.preview && !D.track.preview && !forceScript) return mixShort(D, I, tr, to, kind);
+  // tempo sync: match incoming to outgoing (allowing half/double time) within ±4 %, and hold that block tempo
   const outBpm = (D.track.bpm || 120) * D.el.playbackRate, inBpm = tr.bpm || 120;
   const ratio = tempoRatio(inBpm, outBpm);   // multiply incoming rate by this
   const short = shortBlend();
-  const synced = !!(D.track.bpm && tr.bpm && Math.abs(ratio - 1) <= (short ? 0.1 : 0.08) && opt('tempoSync').checked && (!short || (beatOk(D.track) && beatOk(tr))));   // short blends tolerate a bit more stretch: 1 bar of overlap, then the rate glides home
-  I.el.playbackRate = synced ? ratio : 1; I.el.preservesPitch = true;
+  const synced = !!(D.track.bpm && tr.bpm && Math.abs(ratio - 1) <= 0.04 && opt('tempoSync').checked && (!short || (beatOk(D.track) && beatOk(tr))));
+  I.el.playbackRate = synced ? ratio : 1; I.lockRate = I.el.playbackRate; I.el.preservesPitch = true;
   const planned = kind === 'auto' && synced && S.plan && S.plan.script && S.plan.key === D.track.id + '>' + tr.id ? S.plan.script : null;
-  let script = forceScript || planned || (kind === 'quick' ? (short ? (synced ? 'swap' : 'echoOut') : synced ? pick(['filter', 'echo']) : 'echo') : chooseScript(D, I, synced));
+  let script = forceScript || planned || (kind === 'quick' ? (short ? (synced ? 'swap' : 'echoOut') : synced ? 'filter' : 'echo') : chooseScript(D, I, synced));
   let SC = SCRIPTS[script]; S.lastScript = script;
   const B = D.beatSec;
   if (short && script === 'swap' && ((D.track.dur || D.el.duration) - D.el.currentTime) / (D.el.playbackRate || 1) < 7 * B + 0.4) { script = 'quick'; SC = SCRIPTS.quick; S.lastScript = script; }   // no room for a bar of overlap at the very end
@@ -1154,6 +1591,35 @@ async function transition(kind = 'auto', toIdx = null, forceScript = null) {
   setTimeout(() => $('#xfadeBadge').classList.add('on'), dt * 1000);
   setTimeout(() => finishTransition(D, I, to), Math.max(0, (r.end - ctx.currentTime) * 1000 + 60));
 }
+/* hip-hop / 华语 transitions: the planned pair (decideMix) lands B's cue exactly on A's out point P (a downbeat) */
+function mixShort(D, I, tr, to, kind) {
+  const rateA = D.el.playbackRate || 1, B = D.beatSec, now = ctx.currentTime, MP = S.mixPlan;
+  let plan = kind === 'auto' && MP && MP.id === D.track.id && MP.pair && MP.pair.next === tr.id ? MP.pair : null, Tone = null, P = MP && MP.P;
+  const leadOf = p => Math.max(p.lead * B, p.preB / p.rateB) + 0.05;
+  if (plan) { const dtP = (P - D.el.currentTime) / rateA; if (dtP >= leadOf(plan) + 0.03 && dtP < leadOf(plan) + 3) Tone = now + dtP; }
+  if (Tone == null) {   // manual skip / late trigger: the next downbeat that leaves room for the lead-in
+    const x = arcX(S.idx + 1), info = { x, reset: tr._slot === 'reset', manual: kind !== 'auto' };
+    let dt = D.untilBeat(4, 1.1 * B + 0.1); P = D.el.currentTime + dt * rateA; plan = decideMix(D.track, rateA, P, tr, info);
+    if (leadOf(plan) + 0.03 > dt) { dt = D.untilBeat(4, leadOf(plan) + 0.1); P = D.el.currentTime + dt * rateA; plan = decideMix(D.track, rateA, P, tr, info); }
+    Tone = now + dt;
+  }
+  const SC = SCRIPTS[plan.type]; S.lastScript = plan.type; S.lastType = plan.type; S.mixN = (S.mixN || 0) + 1; if (plan.type === 'longBlend') S.longN = (S.longN || 0) + 1;
+  I.el.playbackRate = plan.rateB; I.lockRate = plan.lockB; I.el.preservesPitch = true;
+  const inAt = Tone - plan.preB / plan.rateB, want = Math.max(0, plan.cue - plan.preB);
+  I.startAt = want; if (Math.abs(I.el.currentTime - want) > 0.03) I.el.currentTime = want;
+  const T0 = Math.min(Tone - plan.lead * B, inAt) - 0.02;
+  D.unride(); I.unride();
+  [D, I].forEach(x => { [x.xf.gain, x.low.gain, x.mid.gain, x.high.gain, x.hp.frequency, x.lp.frequency, x.rSend.gain, x.dSend.gain, x.gate.gain].forEach(p => hold(p, Math.max(now, T0))); });
+  I.restore(now, 0.01); I.xf.gain.setValueAtTime(0, now);
+  D.auto = I.auto = true;
+  const r = plan.type === 'echoOut' ? SC.fn(D, I, Tone - 4 * B, B, 4) : SC.fn(D, I, Tone, B, plan);
+  showFx(SC.label + (plan.sync ? ' · SYNC' : ''), Math.max(now, T0), true, Math.max(1.5, r.end - T0), D.name + '→' + I.name);
+  logMix(D, tr, plan.type, plan.sync, kind, Tone, { inAt, end: r.end, one: Tone }, plan);
+  const lat = 0.035;
+  setTimeout(() => { if (S.inTrans) I.el.play().then(() => { if (plan.sync) setTimeout(() => phaseNudge(D, I, 3), 300); }).catch(console.warn); }, Math.max(0, (inAt - ctx.currentTime - lat) * 1000));
+  setTimeout(() => $('#xfadeBadge').classList.add('on'), Math.max(0, (T0 - now) * 1000));
+  setTimeout(() => finishTransition(D, I, to), Math.max(0, (r.end - ctx.currentTime) * 1000 + 60));
+}
 /* beat-phase correction after the incoming deck starts (like nudging a jog wheel) */
 function phaseNudge(D, I, tries = 1) {
   if (!S.inTrans || D.el.paused || I.el.paused || !D.track.an || !I.track.an || S.braking) return;
@@ -1166,18 +1632,21 @@ function phaseNudge(D, I, tries = 1) {
 }
 /* mix log (window.NEONDJ.S.mixLog): where each track was mixed out, how much of it played, overlap, grid used, and whether the
  * overlap touched a detected high-energy bar of the outgoing track */
-function logMix(D, tr, script, synced, kind, T, r) {
+function logMix(D, tr, script, synced, kind, T, r, plan = null) {
   const o = D.track, rate = D.el.playbackRate || 1, outT = D.el.currentTime + (T - ctx.currentTime) * rate, outEnd = outT + (r.end - T) * rate;
-  const dur = o.dur || D.el.duration || 0, M = barMap(o), P = S.mixPlan && S.mixPlan.id === o.id ? S.mixPlan : {};
+  const dur = o.dur || D.el.duration || 0, M = barMap(o), P = S.mixPlan && S.mixPlan.id === o.id ? S.mixPlan : {}, st = stOf(o), sb = stOf(tr);
   let inHigh = false; if (M) for (let k = M.at(outT + 0.05); k <= M.at(outEnd - 0.05); k++) if (M.hi[k]) inHigh = true;
   const e = { title: o.title, artist: o.artist, dur: +dur.toFixed(1), from: +S.segStart.toFixed(1), out: +outT.toFixed(1), played: +(outT - S.segStart).toFixed(1),
     pct: dur ? +((outT - S.segStart) / dur * 100).toFixed(1) : null, script, kind, aligned: synced, beatOk: [beatOk(o), beatOk(tr)], overlap: +Math.max(0, r.end - r.inAt).toFixed(2),
     reason: P.reason || kind, map: !!M, highs: M ? M.secs.map(([a, b]) => [+M.t(a).toFixed(1), +M.t(b).toFixed(1)]) : [], inHigh, holds: P.holds || 0, next: tr.title };
+  if (plan) Object.assign(e, { hb: st ? +((outT - S.segStart) / st.hbar).toFixed(1) : null, onPhrase: st ? onPhrase(st, outT) : null, x: P.x ?? null, why: plan.why, cue: +plan.cue.toFixed(2), cueKind: plan.cueKind,
+    cueVocal: plan.cueVocal != null ? +plan.cueVocal.toFixed(2) : null, rateB: +plan.rateB.toFixed(4), lockB: +plan.lockB.toFixed(4), gap: plan.gap, fam: plan.fam, rateA: +rate.toFixed(4), vocConfB: sb ? +sb.vocConf.toFixed(2) : null });
   (S.mixLog || (S.mixLog = [])).push(e); console.info('[mix]', JSON.stringify(e));
 }
 function finishTransition(D, I, to) {
   const t = ctx.currentTime;
-  D.el.pause(); S.braking = false; D.el.preservesPitch = true; D.el.playbackRate = 1;
+  D.el.pause(); S.braking = false; D.el.preservesPitch = true; D.el.playbackRate = 1; D.lockRate = 1;
+  S.playedSec = (S.playedSec || 0) + Math.max(0, t - (S.liveSince ?? t)); S.liveSince = t;
   hold(D.xf.gain, t); D.xf.gain.setValueAtTime(0, t + 0.01);
   D.restore(t + 0.02, 0.08); I.restore(t, 0.08);
   D.auto = I.auto = false; D.ready = false;
@@ -1216,7 +1685,7 @@ function tick() {
       if (!d.el.ended && P && P.id === d.track.id && !P.map && P.reason !== 'preview' && d.sec && d.sec.name === 'drop' && P.holds < 2 && S.transAt + 16 * bs < (P.cap || 0)) { P.holds++; S.transAt += 16 * bs; return; }
       transition('auto'); return;
     }
-    const r = d.el.playbackRate; if (!S.braking && Math.abs(r - 1) > 0.0005) d.el.playbackRate = r + Math.sign(1 - r) * Math.min(0.00025, Math.abs(1 - r));
+    const r = d.el.playbackRate, tg = d.lockRate || 1; if (!S.braking && Math.abs(r - tg) > 0.0005) d.el.playbackRate = r + Math.sign(tg - r) * Math.min(0.00025, Math.abs(tg - r));   // hold the block tempo (≤ ±4 %); glide ≈ 0.25 %/s after a tempo step
     if (opt('autoFx').checked) { trackSection(d); if (hype()) perform(d, t); else flourish(d, t); ride(d, t); }
   }
 }
@@ -1332,10 +1801,10 @@ const MOVES = {
 /* which moves suit a reason in each style (weights); cuts are filtered again by the cooldown */
 const MOVE_MENU = {
   dropSoonEarly: { club: { hpBuild: 1, flange: 0.3, phaser: 0.2 }, trap: { hpBuild: 0.6, lpSweep: 0.4 }, song: { lpSweep: 0.6, hpBuild: 0.4 }, chill: { lpSweep: 1 } },
-  dropSoonLast:  { club: { bassKill: 1, roll: 0.35, stutter: 0.2 }, trap: { bassKill: 1, brake: 0.3, roll: 0.15 }, song: { throw: 1, bassKill: 0.3 }, chill: { throw: 1 } },
+  dropSoonLast:  { club: { bassKill: 1 }, trap: { bassKill: 1 }, song: { bassKill: 0.5, throw: 0.5 }, chill: { throw: 1 } },   // no mid-song loop rolls / stutters
   intoBreak:     { club: { verb: 0.6, lpSweep: 0.6 }, trap: { verb: 0.5, throw: 0.5 }, song: { verb: 1 }, chill: { verb: 1 } },
-  plateau:       { club: { hpSweep: 0.6, lpSweep: 0.6, bassSwap: 0.5, gate: 0.12 }, trap: { lpSweep: 0.6, bassSwap: 0.4 }, song: { lpSweep: 1 }, chill: { lpSweep: 1 } },
-  phraseEnd:     { club: { throw: 1 }, trap: { throw: 1 }, song: { throw: 1 }, chill: { throw: 1 } },
+  plateau:       { club: { hpSweep: 0.6, lpSweep: 0.6, bassSwap: 0.5, gate: 0.12 }, trap: {}, song: {}, chill: { lpSweep: 1 } },   // hip-hop / 华语: no moves for their own sake
+  phraseEnd:     { club: { throw: 1 }, trap: {}, song: {}, chill: { throw: 1 } },
 };
 const REASON_P = { dropSoonEarly: 0.55, dropSoonLast: 0.5, intoBreak: 0.4, plateau: 0.3, phraseEnd: 0.22 };
 function perform(d, t) {
@@ -1362,7 +1831,7 @@ function perform(d, t) {
   if (reason !== 'dropSoonLast' && quiet < H.rest && !(reason === 'dropSoonEarly' && quiet >= 1)) return;   // let the track breathe
   if (d._perfUntil > now && !(reason === 'dropSoonLast' && d._perfKey === 'hpBuild')) return;          // the build-up may end in a bass kill
   if (toMix < (ahead + len + 8) * B) return;                                                             // never run into the mix
-  if (rng() > Math.min(0.9, REASON_P[reason] * H.p)) return;
+  if (rng() > Math.min(0.9, REASON_P[reason] * H.p * (style === 'trap' || style === 'song' ? 0.6 : 1))) return;   // rap / R&B get more space
   const menu = MOVE_MENU[reason][style];
   const cutOk = style === 'club' || style === 'trap' ? now - (S.lastCut || -1e9) > H.cutGap && rng() < (H === HYPE.wild ? 0.6 : 0.35) : false;
   const fits = Object.entries(menu).filter(([k]) => { const M = MOVES[k]; return (!M.cut || cutOk) && (!M.ok || M.ok(d)) && (k !== 'gate' || H === HYPE.wild) && (M.layer !== 'mod' || (H.layers && !(d._modUntil > now))); });
@@ -1420,7 +1889,7 @@ async function steer() {
     const b2 = fresh.slice().sort((a, b) => fit(a, ref, newMid) - fit(b, ref, newMid))[0]; bridges.push(b2);
     bridges.forEach(t => { t.pinned = true; t.bridge = true; });
     fresh = fresh.filter(t => t !== b2);
-    const tail = sequence(fresh, opt('order').value === 'found' ? 'found' : 'build', [b2]).slice(1);
+    const tail = sequence(fresh, opt('order').value === 'found' ? 'found' : 'build', [b2], keep.length + bridges.length - 1).slice(1);
     S.set = keep.concat(bridges, tail);
     S.params = { ...params, genres: res.info.genres, moods: res.info.moods };   // endless mode digs the new vibe from now on
     renderList(); analyzeAll();
@@ -1434,7 +1903,7 @@ function flourish(d, t) {
   const B = d.beatSec, bpos = d.beatPos(), nb = Math.ceil(bpos / 32) * 32, ahead = nb - bpos;
   const tb = ctx.currentTime + ahead * B, toMix = (S.transAt - t) / (d.el.playbackRate || 1);
   if (bpos < 24 || toMix < (ahead + 12) * B) return;
-  const p = fxAmt(), chill = isChillSet(), sc = d.sec || {}, dropSoon = sc.name === 'build' || (sc.name === 'breakdown' && sc.lowRun >= 3);
+  const p = fxAmt() * (shortBlend() ? 0.5 : 1), chill = isChillSet(), sc = d.sec || {}, dropSoon = sc.name === 'build' || (sc.name === 'breakdown' && sc.lowRun >= 3);
   if (ahead > 8.2 && ahead < 9.3 && S.lastRiser !== nb) {
     S.lastRiser = nb;
     if (!chill && dropSoon && (tr.energy ?? .5) > 0.5 && rng() < p * 3) {   /* only when a drop is actually coming */ Master.riser(tb - 8 * B, 8 * B); Master.impact(tb, 0.45); showFx('RISER → DROP', tb - 8 * B, false, 8 * B, d.name); }
@@ -1455,15 +1924,18 @@ function flourish(d, t) {
 
 /* endless mode: dig more of the same vibe before the set runs out */
 async function maybeExtend() {
-  if (!opt('endless').checked || S.extending || !S.params) return;
-  const left = S.set.slice(S.idx + 1).filter(t => !t.bad).length; if (left > 2) return;
+  if (S.extending || !S.params) return;
+  const ahead = S.set.slice(S.idx + 1).filter(t => !t.bad).length;
+  // endless: keep ~6 tracks queued; fixed length: top up while the queue would end before the chosen set length
+  const short = !opt('endless').checked && (S.playedSec || 0) + (ahead + 1) * EST_PLAY * 1.1 < setLenSec() - 2 * EST_PLAY;   // ×1.1: the closing block runs longer
+  if (!(opt('endless').checked ? ahead <= 6 : short)) return;
   S.extending = true;
   try {
     const exclude = new Set(S.set.map(t => t.id));
-    const res = await digCrates({ ...S.params, need: 8, onStatus: () => { } });
+    const res = await digCrates({ ...S.params, need: 12, onStatus: () => { } });
     const fresh = res.tracks.filter(t => !exclude.has(t.id));
     if (fresh.length) {
-      const head = S.set.slice(0, S.idx + 2); const seq = sequence(fresh, 'build', [head[head.length - 1]]).slice(1);
+      const head = S.set.slice(0, S.idx + 2); const seq = sequence(fresh, 'build', [head[head.length - 1]], head.length - 1).slice(1);
       S.set = head.concat(seq, S.set.slice(S.idx + 2)); renderList(); analyzeAll(); showFx('+' + fresh.length + ' TRACKS DUG', ctx.currentTime);
     }
   } catch (e) { console.warn('extend failed', e); }
@@ -1480,10 +1952,10 @@ async function analyzeAll() {
       if (!todo.length || bid !== S.buildId) break;
       todo.sort((a, b) => a.i - b.i);
       await pool(todo.slice(0, 2), 2, async ({ t }) => {
-        try { t.an = await analyzeTrack(t); if (!t.bpm && t.an.conf > 1.15) t.bpm = t.an.est; }
+        try { applyAnalysis(t, await analyzeTrack(t)); }
         catch (e) { t.anFail = true; console.info('analysis skipped:', t.title, e.message); }
         S.decks.forEach(d => { if (d.track === t && ctx) applyAutoGain(d); });
-        if (S.live && S.live.track === t && !S.inTrans) computeTransAt();
+        if (S.live && !S.inTrans && (S.live.track === t || S.set[nextIdx(S.idx + 1)] === t)) computeTransAt();
         renderList();
       });
     }
@@ -1543,7 +2015,7 @@ function buildSources() { const cur = opt('source').value; opt('source').innerHT
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
 const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiModel'];
-function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
+function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.perTrack != null && o.perTrack !== '0') o.perTrack = 'auto';   /* old fixed lengths (1:30 / 2:30 / 3:30) -> phrase-based */ if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
 function saveOpts() { const o = {}; PERSIST.forEach(k => { const el = opt(k); if (el) o[k] = el.type === 'checkbox' ? el.checked : el.value; }); localStorage.setItem('neondj.opts', JSON.stringify(o)); }
 
 async function build() {
@@ -1553,11 +2025,15 @@ async function build() {
   rng = mulberry32((Date.now() ^ (Math.random() * 1e9)) & 0xffffffff);
   const prov = Providers.resolve(opt('source').value), caps = prov.capabilities;
   const params = { genres: selected('genres'), moods: selected('moods'), prompt: $('#prompt').value.trim(), source: prov.id, taste: opt('taste').value };
-  const pt = perTrack() || 300, eff = Math.max(20, (caps.fullTrack ? pt : caps.previewSeconds) - xfLen());
-  const need = clamp(Math.ceil(+opt('setLen').value * 60 / eff) + 1, 4, 30);
+  // phrase-based lengths: ~52 s a track (hip-hop / 华语), ~70 s in club sets; Full plays whole songs. Longer sets top up while playing.
+  const vocalLed = params.genres.some(g => g === 'hiphop' || (GENRES[g] && GENRES[g].cn)), pt = fullSongs() ? 210 : vocalLed ? EST_PLAY : 70, eff = Math.max(20, caps.fullTrack ? pt : caps.previewSeconds - xfLen());
+  // the closing block runs longer (~1.4×) and the closer plays out, so it needs fewer tracks than a flat estimate
+  const L = +opt('setLen').value * 60, phr = caps.fullTrack && !fullSongs();
+  const need = clamp(phr ? Math.ceil(0.8 * L / eff + Math.max(0, 0.2 * L - 150) / (1.4 * eff)) + 2 : Math.ceil(L / eff) + 2, 4, 48);
   S.buildId++;
   try {
     setStatus('Finding tracks…', 'busy');
+    if (!(S.playing && S.live && !S.inTrans)) { S.playedSec = 0; S.mixN = 0; S.longN = 0; S.lastType = ''; S.mixLog = []; }
     let res;
     try { res = await digCrates({ ...params, need, onStatus: s => setStatus(s, 'busy') }); if (!res.tracks.length) throw new Error('no tracks'); }
     catch (e) {
@@ -1577,7 +2053,7 @@ async function build() {
       S.set = fresh; S.idx = -1; renderAll();
       // listen first: analyse the crate (bounded time) so the opener and arc are chosen from real audio features
       let done = 0; const deadline = sleep(14000);
-      const job = pool(fresh, 3, async t => { try { t.an = await analyzeTrack(t); if (!t.bpm && t.an.conf > 1.15) t.bpm = t.an.est; } catch (e) { t.anFail = true; }
+      const job = pool(fresh, 3, async t => { try { applyAnalysis(t, await analyzeTrack(t)); } catch (e) { t.anFail = true; }
         done++; if (!S.playing) setStatus(`Analysing ${done}/${fresh.length}…`, 'busy'); });
       await Promise.race([job, deadline]);
       S.set = sequence(fresh.filter(t => !t.bad), opt('order').value, []); renderAll();
@@ -1590,7 +2066,7 @@ async function build() {
 }
 
 function updateListInfo() {
-  const live = S.set.filter(t => !t.bad); const tot = live.reduce((s, t) => s + Math.min(t.dur || 0, perTrack() || t.dur || 0), 0) - xfLen() * Math.max(0, live.length - 1);
+  const live = S.set.filter(t => !t.bad), per = fullSongs() ? Infinity : shortBlend() ? EST_PLAY : 70; const tot = live.reduce((s, t) => s + Math.min(t.dur || 0, per), 0) - (shortBlend() ? 0 : xfLen() * Math.max(0, live.length - 1));
   const bpms = live.map(t => t.bpm).filter(Boolean);
   $('#listInfo').textContent = live.length ? `${live.length} · ~${Math.round(tot / 60)} min${bpms.length ? ` · ${Math.round(Math.min(...bpms))}–${Math.round(Math.max(...bpms))} BPM` : ''}` : '';
 }
@@ -2010,6 +2486,7 @@ function init() {
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
   });
-  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, barMap, build, digCrates, sequence, analyzeTrack, transition, SCRIPTS, Master, MOVES });   // for debugging / tests (+ .providers)
+  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
+    structureOf, cueFor, planOut, decideMix, tempoFam, arcX, stOf, beatOk, isZh, energyOf, markTiers, computeTransAt, onPhrase, vocalIn, keyDist });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();

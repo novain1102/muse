@@ -47,13 +47,21 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    right after a hook / drop ends, then a calmer stretch, then earlier; past the window it holds to the next clean boundary,
    and a song that ends on its hook plays it out. Without an energy map, the live section detector holds a mix that would land
    in a drop (up to 2 phrases).
-   **Hip-Hop / Trap and 华语 (rhythm-dense, vocal-led)**: each track plays most of the song (≥ 65 % and ≥ 2:30, about
-   80 % in tests; short tracks play out). Blends are short: when both grids are trustworthy (metadata agrees or onset
-   confidence ≥ 1.3) and tempos are within ±10 %, a 1-bar **bass swap** — the next track (cued one bar early) runs with its
-   lows cut, kick / 808 hand over on the 1 of its phrase, the old track is gone 2 beats later (≈ 3–6 s overlap, one low end
-   at a time), with a start-latency correction + jog nudges. Otherwise an **echo out**: the old bar filters up and throws an
-   echo, the new track starts clean on its own downbeat (no rhythmic overlap). No long mashups in these sets. House /
-   techno keep the long blends and Hype mashups.
+   **Hip-Hop / Trap and 华语 (rhythm-dense, vocal-led)**: no fixed play time. Every song gets a full-length structure
+   pass (whole-song beat grid, downbeat and 4-bar phrase phase, vocal-band activity minus drums → first vocal entry and
+   vocal line ends, drumless intro, breaks, hi-hat density, 808 weight). A track plays whole phrases — 12–24 half-time bars
+   (about 40–80 s, typically ~16 / ~50 s), up to ~40 in the closing block — and leaves on a phrase boundary, preferring
+   the end of a vocal line or a break and never cutting through a hook / drop. The next track comes in on a downbeat about
+   one bar before its first vocal (or at its drop / drumless intro), not from 0 s. A deterministic decision table picks
+   the move from the two tracks' features: **phrase cut** (default), **drop swap** (A breaks, B lands on the 1),
+   **bass swap** (one bar of B's tops, lows swapped on the 1 — never two 808s or two vocals stacked), **long blend** (only
+   key-compatible, both sides instrumental, ≤ ~12 % of mixes), **brake** / **tempo mask** for 1.6–5 % tempo steps,
+   **ratio cut** for 3:2 / 2:1, **drumless reset** into a beatless intro, **echo out** otherwise. Within a block the
+   tempo is locked (±4 % max stretch); bigger changes only happen at block boundaries, masked. No FX for their own sake:
+   no mid-song stutter / loop roll in these sets, and hip-hop / R&B get more space. House / techno keep the long blends.
+   **Order** (P1): tempo ladder (neighbours ≤ 1.6 % or 3:2), the same artist at most once in any 5 tracks, at most 2–3
+   Chinese-language tracks in a row in mixed sets, a drumless-intro reset around 40–50 % of the set and the biggest gear
+   shift around 66–80 %. *Per track*: **Phrases** (default) or **Full** songs.
 
 ## ♥ Likes & taste (红心 → 按你的品味挖歌)
 - Tap **♡** on the now-playing card (or press **L**) or on any row in the tracklist to like a track; tap again to un-like.
@@ -132,7 +140,7 @@ do **nothing** — no quota of moves per minute. A move happens only when the mu
 bar and landed on the phrase grid (when inside a phrase varies with the reason, plus randomness):
 - **a drop is coming** (build, or a breakdown that has run 4+ bars): a high-pass build-up over the last 2–4 bars (Club sets add
   a riser), then the bass pulled on the last beat and slammed back in on the 1. Only here, and rarely, a cut — a short loop
-  roll, a ⅛ stutter or a tape stop: at most one per ~3 min in Club (~75 s in Wild), only in club / hip-hop sets, never in
+  roll, a ⅛ stutter or a tape stop: at most one per ~3 min in Club (~75 s in Wild), only in club sets (never in hip-hop / 华语 sets), never in
   chill or vocal-led (华语) sets;
 - **into a breakdown**: a reverb swell or a slow low-pass sweep down;
 - **a long plateau** (4+ untouched phrases in Club, 2+ in Wild): one slow HP or LP sweep over 8 or 16 bars, or a bass swap
@@ -142,7 +150,7 @@ bar and landed on the phrase grid (when inside a phrase varies with the reason, 
 Moves follow the style of the set: club (house / techno / bass …), trap (hip-hop), song (vocal-led), chill. After each move
 the track is left alone (Club ≥ 2 phrases, Wild ≥ 1). Smooth uses only filter dips into drops, reverb into breakdowns and
 echo throws after long quiet stretches — no cuts; the subtle EQ "rides" only come after 3+ untouched phrases.
-Transition scripts follow the same idea: loop-roll / tape-stop mixes only into a clear energy lift, in club / hip-hop sets,
+Transition scripts follow the same idea: loop-roll / tape-stop mixes only into a clear energy lift, in club sets,
 within the same cut cooldown. Measured on the box (4–6 min runs, moves per mid-track minute, before → after): Club tech-house 6.4 → 1.4 (of which
 1.0 subtle EQ rides), Wild tech-house 14.7 → 1.4–1.7, Club hip-hop 3.4 → 0.2; glitch cuts (roll / stutter / gate / chop)
 mid-track 3.2 / 7.5 / 2.8 → 0 per minute — they now come only right before a detected drop, behind a long cooldown.
