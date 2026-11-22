@@ -194,17 +194,13 @@ async function pool(items, n, fn) {
 
 /* ---------- optional keyword expansion (user's own OpenAI key): at most one tiny call per build, cached ---------- */
 async function aiExpand(genres, moods, prompt) {
-  const on = $('#aiOn').checked, key = $('#aiKey').value.trim();
-  if (!on || !key) return [];
-  const model = ($('#aiModel').value || 'gpt-4o-mini').trim();
+  const cfg = llmCfg(); if (!cfg.on) return [];
   const desc = [genres.map(g => GENRES[g].label).join('/'), moods.map(m => MOODS[m].label).join('/'), prompt].filter(Boolean).join(', ');
   const ck = 'neondj.ai.' + desc.toLowerCase();
   const cached = localStorage.getItem(ck); if (cached) { try { return JSON.parse(cached); } catch (e) { } }
   try {
-    const r = await fetchJSON('https://api.openai.com/v1/chat/completions', 15000, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-      body: JSON.stringify({ model, temperature: 0.7, max_tokens: 90, response_format: { type: 'json_object' },
-        messages: [{ role: 'user', content: `Vibe: ${desc}. Give 6 short (1-3 word) search keywords a crate-digging DJ would use to find underground, non-chart tracks: sub-genres, scene terms, textures. No artist names. JSON: {"k":[...]}` }] }) });
-    const k = JSON.parse(r.choices[0].message.content).k.filter(x => typeof x === 'string').slice(0, 6).map(x => x.toLowerCase().slice(0, 40));
+    const r = await llmChat(cfg, [{ role: 'user', content: `Vibe: ${desc}. Give 6 short (1-3 word) search keywords a crate-digging DJ would use to find underground, non-chart tracks: sub-genres, scene terms, textures. No artist names. JSON: {"k":[...]}` }]);
+    const k = r.k.filter(x => typeof x === 'string').slice(0, 6).map(x => x.toLowerCase().slice(0, 40));
     localStorage.setItem(ck, JSON.stringify(k)); return k;
   } catch (e) { console.warn('keyword expansion failed (ignored):', e); return []; }
 }
@@ -1180,7 +1176,9 @@ function planOut(tr, start, x, opts = {}) {
     cands.push({ P, k, L, s, through, phr, vEnd, vThru, after, brk });
   }
   const ok = cands.filter(c => !c.through);
-  if (ok.length) { const b = ok.reduce((a, c) => c.s > a.s + 1e-9 ? c : a); return { ...b, reason: b.brk ? 'break' : b.after ? 'after-highlight' : b.vEnd ? 'vocal-end' : b.phr ? 'phrase' : 'bar', map: true, target: T }; }
+  if (ok.length) { const b = ok.reduce((a, c) => c.s > a.s + 1e-9 ? c : a), why = c => c.brk ? 'break' : c.after ? 'after-highlight' : c.vEnd ? 'vocal-end' : c.phr ? 'phrase' : 'bar';
+    const alts = ok.slice().sort((a, c) => c.s - a.s).slice(0, 4).map(c => ({ P: c.P, L: c.L, s: c.s, reason: why(c), vThru: c.vThru }));   // menu for the optional LLM layer
+    return { ...b, reason: why(b), map: true, target: T, alts }; }
   // everything in range sits inside a highlight: hold until it ends, else let the song play out
   for (let k = barIdx(st, start + Lmax * hb) + 1; barT(st, k) <= cap; k++) if (!(hiAt(k - 1) && hiAt(k))) return { P: barT(st, k), k, L: (barT(st, k) - start) / hb, reason: 'held-past-highlight', map: true, target: T };
   return { P: Math.max(start + 8, cap), L: (cap - start) / hb, reason: 'played-out', map: true, target: T };
@@ -1203,14 +1201,15 @@ function decideMix(A, rateA, P, Bt, info = {}) {
   const aBreak = !!(sa && sa.breaks.some(([a, b]) => b === barIdx(sa, P + 0.05) && b - a <= 4));
   const aVocThru = (vA([P - Ba, P]) || 0) > 0.5;
   const bPreFree = sb && cueV.t >= 4 * Bb ? (vocalIn(sb, cueV.t - 4 * Bb, cueV.t) ?? 1) <= 0.25 : false;
+  const drop = cueFor(Bt, 'drop');
+  const nb = sa ? 4 * sa.hbar / Ba : 16, bInst = sb ? cueV.t - nb * Bb >= 0 && (vocalIn(sb, cueV.t - nb * Bb, cueV.t) ?? 1) <= 0.1 : false;
+  const aInst = sa ? (vA([P - nb * Ba, P]) ?? 1) <= 0.1 || sa.breaks.some(([a, b]) => barT(sa, a) <= P - nb * Ba && barT(sa, b) >= P) : false;
+  const quota = ((S.mixN || 0) ? (S.longN || 0) / (S.mixN || 1) : 0) < 0.12 && S.lastType !== 'longBlend';
+  const longOk = sync && gap <= 0.016 && keyOk && aInst && bInst && quota && !info.manual;
   if (info.reset && sb && sb.drumless >= 8) { type = 'drumlessReset'; why.push(`reset slot, ${Math.round(sb.drumless)} s drumless intro`); }
   else if (sync) {
-    const drop = cueFor(Bt, 'drop');
-    const nb = sa ? 4 * sa.hbar / Ba : 16, bInst = sb ? cueV.t - nb * Bb >= 0 && (vocalIn(sb, cueV.t - nb * Bb, cueV.t) ?? 1) <= 0.1 : false;
-    const aInst = sa ? (vA([P - nb * Ba, P]) ?? 1) <= 0.1 || sa.breaks.some(([a, b]) => barT(sa, a) <= P - nb * Ba && barT(sa, b) >= P) : false;
-    const quota = ((S.mixN || 0) ? (S.longN || 0) / (S.mixN || 1) : 0) < 0.12 && S.lastType !== 'longBlend';
     if (aBreak && (drop.kind === 'drop' || (sb && cueV.kind === 'vocal'))) { type = 'dropSwap'; if (drop.kind === 'drop') cue = drop; why.push('A breaks before the 1, B lands full-band'); }
-    else if (gap <= 0.016 && keyOk && aInst && bInst && quota && !info.manual) { type = 'longBlend'; n = Math.round(nb); why.push('same key, both sides instrumental'); }
+    else if (longOk) { type = 'longBlend'; n = Math.round(nb); why.push('same key, both sides instrumental'); }
     else if (bPreFree && (aVocThru || (heavyLow(sa) && heavyLow(sb)))) { type = 'bassSwap'; why.push(aVocThru ? 'A still rapping at the 1: one bar of B tops, lows swapped on the 1' : 'two heavy 808s: lows swapped on the 1'); }
     else { type = 'phraseCut'; why.push(sa && sa.vocConf >= 0.2 ? (aVocThru ? 'B line starts on the 1' : 'A line ends, B line starts on the 1') : 'phrase boundary'); }
     rateB = lockB = rSync;
@@ -1223,12 +1222,125 @@ function decideMix(A, rateA, P, Bt, info = {}) {
     why.push(`tempo step ${(gap * 100).toFixed(1)} %: ${type === 'brake' ? 'one-beat stop, B slams in' : 'echo throw, B glides to its own tempo'}`);
   } else if (sb && sb.drumless >= 8) { type = 'drumlessReset'; why.push(`tempo ${(gap * 100).toFixed(0)} % away: into B's ${Math.round(sb.drumless)} s drumless intro`); }
   else { type = 'echoOut'; why.push(grid ? `tempo ${(gap * 100).toFixed(0)} % away, no drumless intro` : 'no trustworthy beat grid'); }
+  // types the rules accept for this pair (hard limits: tempo, grid, 808 / vocal stacking, long-blend quota); the LLM may only pick among these
+  const allowed = new Set([type, 'echoOut']), grid1 = opt('tempoSync').checked && grid;
+  if (sync) { allowed.add('phraseCut'); if (bPreFree && cueV.t >= 4 * Bb) allowed.add('bassSwap'); if (aBreak && (drop.kind === 'drop' || (sb && cueV.kind === 'vocal'))) allowed.add('dropSwap'); if (longOk) allowed.add('longBlend'); }
+  else { if (grid1 && fam.kind === '3:2' && Math.abs(fam.d) <= 0.01) allowed.add('ratioCut'); if (grid1 && fam.kind === '1:1' && gap <= 0.05) { allowed.add('tempoMask'); if (cueV.kind === 'vocal') allowed.add('brake'); } }
+  if (sb && sb.drumless >= 8) allowed.add('drumlessReset');
+  if (info.force && info.force !== type && allowed.has(info.force)) {
+    type = info.force; why = ['LLM pick among rule candidates']; cue = cueV; n = 0;
+    rateB = lockB = sync && ['phraseCut', 'bassSwap', 'dropSwap', 'longBlend'].includes(type) ? rSync : 1;
+    if (type === 'dropSwap' && drop.kind === 'drop') cue = drop;
+    if (type === 'longBlend') n = Math.round(nb);
+    if (type === 'tempoMask') { rateB = clamp(Math.exp(-fam.d), 0.96, 1.04); lockB = 1; }
+  }
   if (type === 'drumlessReset') { cue = cueFor(Bt, 'intro'); if (canSync && gap <= 0.04) { rateB = lockB = Math.exp(-fam.d); } }
   if (type === 'bassSwap' && !(cue.t >= 4 * Bb)) type = 'phraseCut';
   const T = MIXT[type], lead = T.lead === 'n' ? n : T.lead, preBeats = T.pre === 'n' ? n : T.pre;
   const preB = Math.min(cue.t, preBeats * Bb);                       // B track seconds before its cue (≥ 0)
   return { type, why: why.join('; '), cue: cue.t, cueKind: cue.kind, cueVocal: cueV.vocal ?? null, preB, rateB, lockB, lead, n, gap: +(gap * 100).toFixed(2), fam: fam.kind, sync, next: Bt.id,
-    aVocThru, aBreak, keyOk };
+    aVocThru, aBreak, keyOk, allowed: [...allowed] };
+}
+/* ---------- optional LLM layer (Advanced → LLM assist; off by default) ----------
+ * Hybrid: the rules build a small candidate menu per pair (out-point from planOut's best phrase ends × the transition types
+ * decideMix accepts for that pair, each with its cue / play length); the model only returns candidate ids; the rules re-check
+ * the pick when it is used. Rolling cache: decisions for the next few pairs (≤ 5 ahead, 3–4 per request), keyed by the exact
+ * chain state (A, B, A's start, A's rate), so a changed order / pick simply misses and is re-asked. Transitions never wait:
+ * a cache hit is used, a miss plays the rules plan while the model answers in the background. Any failure → rules. */
+const LLM = { cache: new Map(), busy: false, fails: 0, until: 0, last: null, log: [], req: 0 };
+const llmCfg = () => {
+  const on = opt('aiOn') && opt('aiOn').checked, base = ((opt('aiBase') && opt('aiBase').value) || 'https://api.openai.com/v1').trim().replace(/\/+$/, '');
+  const key = ((opt('aiKey') && opt('aiKey').value) || '').trim(), model = ((opt('aiModel') && opt('aiModel').value) || 'gpt-4o-mini').trim();
+  return { on: !!(on && base && model && (key || !/api\.openai\.com/.test(base))), base, key, model };
+};
+const LLM_TIMEOUT = 6000, LLM_AHEAD = 5, LLM_BATCH = 4;
+const llmStart = () => S.segCue && S.live && S.segCue.id === S.live.track.id ? S.segCue.t : (S.segStart || 0);   // where the live track came in (its planned cue)
+const llmKey = (A, B, start, rate) => `${A.id}>${B.id}@${start.toFixed(1)}/${rate.toFixed(3)}`;
+async function llmChat(cfg, messages, json = true) {
+  const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), LLM_TIMEOUT);
+  try {
+    const headers = { 'Content-Type': 'application/json' }; if (cfg.key) headers.Authorization = 'Bearer ' + cfg.key;
+    const body = { model: cfg.model, temperature: 0.3, max_tokens: 400, messages }; if (json) body.response_format = { type: 'json_object' };
+    const r = await fetch(cfg.base + '/chat/completions', { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
+    if (!r.ok) { const t = await r.text().catch(() => ''); const e = new Error(`HTTP ${r.status}`); e.status = r.status; e.body = t.slice(0, 200); throw e; }
+    const j = await r.json(), c = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (typeof c !== 'string') throw new Error('no message content');
+    return JSON.parse(c.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ''));
+  } catch (e) { if (e && e.name === 'AbortError') throw new Error('timeout ' + LLM_TIMEOUT + ' ms'); throw e; }
+  finally { clearTimeout(to); }
+}
+/* the candidate menu for one pair: A from `start` at `rate`, into B */
+function llmMenu(A, B, start, rate, x, rest, info) {
+  const sa = stOf(A), sb = stOf(B); if (!sa || !sb || rest <= 0) return null;
+  const out = planOut(A, start, x, { now: start + 1, rest, lead: 4 * 60 / (A.bpm || 120) + 1 }); if (!out || !out.alts) return null;
+  const cands = []; const seen = new Set();
+  out.alts.slice(0, 3).forEach((o, oi) => {
+    const base = decideMix(A, rate, o.P, B, info);
+    [base.type, ...base.allowed.filter(t => t !== base.type)].forEach(t => {
+      const p = t === base.type ? base : decideMix(A, rate, o.P, B, { ...info, force: t }); if (p.type !== t) return;
+      const k = o.P.toFixed(2) + t; if (seen.has(k) || cands.length >= 9) return; seen.add(k);
+      cands.push({ id: 'c' + (cands.length + 1), P: o.P, type: t, rule: oi === 0 && t === base.type, pair: p,
+        d: { out_s: +o.P.toFixed(1), play_s: +((o.P - start) / rate).toFixed(0), bars: +o.L.toFixed(1), out_at: o.reason, rapping_through: !!o.vThru, type: t, b_in_s: +p.cue.toFixed(1), b_in: p.cueKind, rules_default: oi === 0 && t === base.type || undefined } });
+    });
+  });
+  return cands.length ? { out, cands } : null;
+}
+const llmTrack = t => ({ title: (t.title || '').slice(0, 48), artist: (t.artist || '').slice(0, 32), bpm: t.bpm ? +t.bpm.toFixed(1) : null, key: (t.cam && t.cam.s) || null, energy: t.energy != null ? +t.energy.toFixed(2) : null });
+/* walk the chain from the live track: cached picks advance it, misses are batched (3–4) and asked in the background */
+function llmPrefetch(why = '') {
+  const cfg = llmCfg(); if (!cfg.on || !shortBlend() || fullSongs() || LLM.busy || performance.now() < LLM.until) return;
+  const d = S.live; if (!d || !d.track || S.idx < 0) return;
+  const endless = opt('endless').checked; let i = S.idx, A = d.track, start = llmStart(), rate = d.lockRate || 1;
+  const batch = [];
+  for (let h = 0; h < LLM_AHEAD; h++) {
+    const j = nextIdx(i + 1); if (j < 0) break; const B = S.set[j];
+    const rest = endless ? 99 : S.set.slice(i + 1).filter(t => !t.bad).length, info = { x: arcX(i + 1), reset: B._slot === 'reset', lastChange: !endless && nextIdx(j + 1) < 0 };
+    const key = llmKey(A, B, start, rate), hit = LLM.cache.get(key);
+    let next;
+    if (hit) next = hit.pair;
+    else { const m = llmMenu(A, B, start, rate, arcX(i), rest, info); if (!m) break; batch.push({ key, A, B, m, h }); next = m.cands[0].pair; }
+    i = j; start = next.cue; rate = next.lockB; A = B;
+  }
+  // small batches: ask when 3+ are missing, or when the live / next pair has nothing yet
+  if (!batch.length || (batch.length < 3 && batch[0].h > 1)) return;
+  const ask = batch.slice(0, LLM_BATCH); LLM.busy = true; const t0 = performance.now(), rid = ++LLM.req;
+  const sys = 'You are the transition brain of a hip-hop / Chinese rap DJ set. For each pair choose exactly one candidate id from its list. ' +
+    'Every candidate is already rule-checked (beat grid, tempo, no two 808s or two vocals stacked). Prefer: clean phrase / vocal-line ends, B entering just before its first vocal, ' +
+    'short tight cuts in dense rap, a breath (drumless reset / echo) for big tempo or mood changes, variety (avoid the same type 3 times in a row), longer plays near the end of the set. ' +
+    'Reply with JSON only: {"picks":[{"pair":"p1","id":"c2"}]}';
+  const user = { set_position: +arcX(S.idx).toFixed(2), last_types: (S.mixLog || []).slice(-3).map(e => e.script),
+    pairs: ask.map((b, k) => ({ pair: 'p' + (k + 1), from: llmTrack(b.A), to: llmTrack(b.B), candidates: b.m.cands.map(c => ({ id: c.id, ...c.d })) })) };
+  const entry = { rid, at: Date.now(), why, pairs: ask.length, ok: false };
+  llmChat(cfg, [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }])
+    .then(res => {
+      const picks = res && Array.isArray(res.picks) ? res.picks : null; if (!picks) throw new Error('malformed reply (no picks[])');
+      let n = 0;
+      ask.forEach((b, k) => {
+        const p = picks.find(q => q && String(q.pair) === 'p' + (k + 1)), c = p && b.m.cands.find(c => c.id === String(p.id));
+        if (!c) return;   // unknown id → that pair stays on the rules
+        LLM.cache.set(b.key, { P: c.P, type: c.type, id: c.id, rule: c.rule, pair: c.pair, at: performance.now(), rid }); n++;
+      });
+      if (!n) throw new Error('no valid candidate ids');
+      entry.ok = true; entry.n = n; LLM.fails = 0;
+      if (LLM.cache.size > 60) [...LLM.cache.keys()].slice(0, LLM.cache.size - 60).forEach(k => LLM.cache.delete(k));
+    })
+    .catch(e => { entry.err = String(e.message || e).slice(0, 120); LLM.fails++; LLM.until = performance.now() + Math.min(120000, 15000 * LLM.fails); console.warn('[llm] fallback to rules:', entry.err); })
+    .finally(() => {
+      entry.ms = Math.round(performance.now() - t0); LLM.busy = false; LLM.last = entry; LLM.log.push(entry); if (LLM.log.length > 50) LLM.log.shift();
+      // a fresh answer for the live pair replaces its rules plan if there is still time; then keep rolling
+      if (entry.ok && S.live && !S.inTrans && S.mixPlan && S.mixPlan.src === 'rules' && S.mixPlan.id === S.live.track.id) computeTransAt();
+      if (entry.ok) setTimeout(() => llmPrefetch('roll'), 50);
+    });
+}
+/* at plan time: the cached pick for the live pair, re-validated by the rules now (else null → rules) */
+function llmUse(A, B, rate, info, now, lead) {
+  const cfg = llmCfg(); if (!cfg.on || !B || !S.live) return null;
+  const hit = LLM.cache.get(llmKey(A, B, llmStart(), S.live.lockRate || 1)); if (!hit) return null;
+  const st = stOf(A), M = barMap(A), cap = (A.dur || 180) - 4; if (!st) return null;
+  if (!(hit.P > now + lead && hit.P <= cap && hit.P - S.segStart >= 8 * st.hbar)) return null;           // still ahead, not too short
+  const k = barIdx(st, hit.P + 0.05); if (M && k > 0 && k < M.nb && M.hi[k - 1] && M.hi[k]) return null;  // never through a hook / drop
+  const pair = decideMix(A, rate, hit.P, B, { ...info, force: hit.type }); if (pair.type !== hit.type) return null;   // the rules still accept it
+  return { P: hit.P, pair, hit };
 }
 function startPosFor(tr, isFirst) {
   if (tr.preview) return 0;
@@ -1293,8 +1405,13 @@ function computeTransAt() {
       w = 8 * bs; const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1), lo = Math.min(start + 14 * hb, cap), hi = Math.min(start + 22 * hb, cap);
       out = planMixOut(d, lo, hi, cap, w); out.L = (out.P - start) / hb;
     }
-    const pair = nx ? decideMix(tr, rate, out.P, nx, { x: arcX(S.idx + 1), reset: nx._slot === 'reset', lastChange: !endless && nextIdx(ni + 1) < 0 }) : null;
-    S.mixPlan = { id: tr.id, ...out, start, x: +x.toFixed(3), short: true, holds: 0, pair };
+    const info = { x: arcX(S.idx + 1), reset: nx && nx._slot === 'reset', lastChange: !endless && nextIdx(ni + 1) < 0 };
+    let pair = nx ? decideMix(tr, rate, out.P, nx, info) : null, src = 'rules', llm = null;
+    // optional LLM layer: the cached pick for this pair, if the rules still accept it (else the rules plan above)
+    const u = nx && st && rest > 0 && !fullSongs() ? llmUse(tr, nx, rate, info, d.el.currentTime + 1, 4 * bs + 1) : null;
+    if (u) { out = { ...out, P: u.P, reason: 'llm:' + u.hit.id }; pair = u.pair; src = S.mixPlan && S.mixPlan.id === tr.id && S.mixPlan.src === 'rules' ? 'llm' : 'cache'; llm = { id: u.hit.id, rule: u.hit.rule }; }
+    S.mixPlan = { id: tr.id, ...out, start, x: +x.toFixed(3), short: true, holds: 0, pair, src, llm };
+    if (llmCfg().on) setTimeout(() => llmPrefetch('plan'), 0);
     const B = bs / rate, lead = pair ? Math.max(pair.lead * B, pair.preB / pair.rateB) + 0.05 : 4 * B;
     S.transAt = Math.max(start + 4, out.P - (lead + 0.6) * rate);
     // the next deck is already cued: move it to the planned pre-roll point now (not at the last moment)
@@ -1607,6 +1724,7 @@ function mixShort(D, I, tr, to, kind) {
   I.el.playbackRate = plan.rateB; I.lockRate = plan.lockB; I.el.preservesPitch = true;
   const inAt = Tone - plan.preB / plan.rateB, want = Math.max(0, plan.cue - plan.preB);
   I.startAt = want; if (Math.abs(I.el.currentTime - want) > 0.03) I.el.currentTime = want;
+  S.segCue = { id: tr.id, t: plan.cue };
   const T0 = Math.min(Tone - plan.lead * B, inAt) - 0.02;
   D.unride(); I.unride();
   [D, I].forEach(x => { [x.xf.gain, x.low.gain, x.mid.gain, x.high.gain, x.hp.frequency, x.lp.frequency, x.rSend.gain, x.dSend.gain, x.gate.gain].forEach(p => hold(p, Math.max(now, T0))); });
@@ -1640,7 +1758,7 @@ function logMix(D, tr, script, synced, kind, T, r, plan = null) {
     pct: dur ? +((outT - S.segStart) / dur * 100).toFixed(1) : null, script, kind, aligned: synced, beatOk: [beatOk(o), beatOk(tr)], overlap: +Math.max(0, r.end - r.inAt).toFixed(2),
     reason: P.reason || kind, map: !!M, highs: M ? M.secs.map(([a, b]) => [+M.t(a).toFixed(1), +M.t(b).toFixed(1)]) : [], inHigh, holds: P.holds || 0, next: tr.title };
   if (plan) Object.assign(e, { hb: st ? +((outT - S.segStart) / st.hbar).toFixed(1) : null, onPhrase: st ? onPhrase(st, outT) : null, x: P.x ?? null, why: plan.why, cue: +plan.cue.toFixed(2), cueKind: plan.cueKind,
-    cueVocal: plan.cueVocal != null ? +plan.cueVocal.toFixed(2) : null, rateB: +plan.rateB.toFixed(4), lockB: +plan.lockB.toFixed(4), gap: plan.gap, fam: plan.fam, rateA: +rate.toFixed(4), vocConfB: sb ? +sb.vocConf.toFixed(2) : null });
+    src: P.pair === plan ? (P.src || 'rules') : 'rules', llmId: P.pair === plan && P.llm ? P.llm.id : null, cueVocal: plan.cueVocal != null ? +plan.cueVocal.toFixed(2) : null, rateB: +plan.rateB.toFixed(4), lockB: +plan.lockB.toFixed(4), gap: plan.gap, fam: plan.fam, rateA: +rate.toFixed(4), vocConfB: sb ? +sb.vocConf.toFixed(2) : null });
   (S.mixLog || (S.mixLog = [])).push(e); console.info('[mix]', JSON.stringify(e));
 }
 function finishTransition(D, I, to) {
@@ -2014,7 +2132,7 @@ function buildChips() {
 function buildSources() { const cur = opt('source').value; opt('source').innerHTML = Providers.usable().map(p => `<option value="${esc(p.id)}" title="${esc(p.hint || '')}"${p.id === Providers.defaultId ? ' selected' : ''}>${esc(p.label)}</option>`).join(''); if (cur && Providers.usable().some(p => p.id === cur)) opt('source').value = cur; }
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
-const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiModel'];
+const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiBase', 'aiModel'];
 function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.perTrack != null && o.perTrack !== '0') o.perTrack = 'auto';   /* old fixed lengths (1:30 / 2:30 / 3:30) -> phrase-based */ if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
 function saveOpts() { const o = {}; PERSIST.forEach(k => { const el = opt(k); if (el) o[k] = el.type === 'checkbox' ? el.checked : el.value; }); localStorage.setItem('neondj.opts', JSON.stringify(o)); }
 
@@ -2474,6 +2592,7 @@ function init() {
   document.addEventListener('change', e => { if (e.target.closest('.gen, .transport, .pads')) saveOpts(); });
   $('#aiKey').value = localStorage.getItem('neondj.aikey') || '';
   $('#aiKey').addEventListener('change', e => { e.target.value ? localStorage.setItem('neondj.aikey', e.target.value) : localStorage.removeItem('neondj.aikey'); });
+  ['aiOn', 'aiBase', 'aiKey', 'aiModel'].forEach(id => $('#' + id).addEventListener('change', () => { saveOpts(); LLM.cache.clear(); LLM.fails = 0; LLM.until = 0; if (llmCfg().on) llmPrefetch('settings'); }));
   $('#prompt').addEventListener('keydown', e => { if (e.key === 'Enter') build(); });
   // NetEase proxy (Advanced): the NetEase source only appears in the Source menu once a proxy URL is saved
   $('#neteaseProxy').value = Providers.settings.get('neteaseProxy');
@@ -2486,7 +2605,7 @@ function init() {
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
   });
-  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
+  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, LLM, llmCfg, llmPrefetch, llmMenu, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
     structureOf, cueFor, planOut, decideMix, tempoFam, arcX, stOf, beatOk, isZh, energyOf, markTiers, computeTransAt, onPhrase, vocalIn, keyDist });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();

@@ -189,8 +189,18 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
   the current track. Endless mode digs more tracks before the set runs out.
 
 ## Advanced
-- **Keyword expansion** (optional): turns your vibe into a few extra search keywords with your own OpenAI API key
-  (one short request per set, cached; the key stays in this browser). Off by default.
+- **LLM assist** (optional, off by default): toggle + base URL (any OpenAI-compatible `…/v1`), API key, model. Stored in this
+  browser (`neondj.opts`, key in `neondj.aikey`). For full-track Hip-Hop / 华语 sets the rules build a small menu per pair
+  (the top 3 phrase-end out-points × the transition types the decision table accepts for that pair, each with its cue and play
+  length); the model only returns candidate ids (JSON via `/chat/completions`) and the rules re-check the pick when it is used
+  (tempo, grid, no two 808s / vocals stacked, never through a hook). Rolling cache: the next ≤ 5 pairs, asked 3–4 at a time,
+  keyed by the exact chain state, so a reorder or a different pick just re-asks. Transitions never wait: a hit is used, a miss
+  plays the rules plan and a fresh answer replaces it in the background if there is still time. Errors, bad keys, timeouts
+  (6 s) or malformed / unknown ids fall back to the rules (with a 15 s → 2 min back-off). The source of each mix (`rules`,
+  `cache`, `llm`) is in `NEONDJ.S.mixLog[].src`, requests in `NEONDJ.LLM.log`. The same settings also add a few search
+  keywords per set. **CORS**: the browser calls the provider directly; OpenAI allows it, providers that send no CORS headers
+  (and plain-`http` URLs from the hosted `https` page, except localhost) are blocked by the browser — then the rules just run.
+  The NetEase Worker proxy is GET-only for NetEase and is deliberately not used for API keys.
 - **NetEase proxy**: the hosted site uses a built-in proxy; paste your own Worker URL (see `providers/proxy/README.md`) and
   Save to override it — Muse checks it. Clear + Save goes back to the built-in one (opened from file:// there is none). Stored in `localStorage['neondj.provsettings']`.
 
