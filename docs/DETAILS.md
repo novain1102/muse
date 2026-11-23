@@ -189,18 +189,46 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
   the current track. Endless mode digs more tracks before the set runs out.
 
 ## Advanced
-- **LLM assist** (optional, off by default): toggle + base URL (any OpenAI-compatible `…/v1`), API key, model. Stored in this
-  browser (`neondj.opts`, key in `neondj.aikey`). For full-track Hip-Hop / 华语 sets the rules build a small menu per pair
-  (the top 3 phrase-end out-points × the transition types the decision table accepts for that pair, each with its cue and play
-  length); the model only returns candidate ids (JSON via `/chat/completions`) and the rules re-check the pick when it is used
-  (tempo, grid, no two 808s / vocals stacked, never through a hook). Rolling cache: the next ≤ 5 pairs, asked 3–4 at a time,
-  keyed by the exact chain state, so a reorder or a different pick just re-asks. Transitions never wait: a hit is used, a miss
-  plays the rules plan and a fresh answer replaces it in the background if there is still time. Errors, bad keys, timeouts
-  (6 s) or malformed / unknown ids fall back to the rules (with a 15 s → 2 min back-off). The source of each mix (`rules`,
-  `cache`, `llm`) is in `NEONDJ.S.mixLog[].src`, requests in `NEONDJ.LLM.log`. The same settings also add a few search
-  keywords per set. **CORS**: the browser calls the provider directly; OpenAI allows it, providers that send no CORS headers
-  (and plain-`http` URLs from the hosted `https` page, except localhost) are blocked by the browser — then the rules just run.
-  The NetEase Worker proxy is GET-only for NetEase and is deliberately not used for API keys.
+- **LLM assist** (optional, off by default): toggle + strategy preset + base URL (any OpenAI-compatible `…/v1`) + API key
+  (+ model for Custom). Stored in this browser (`neondj.opts`, key only in `neondj.aikey`). Presets (model / timeout / pairs per call):
+  **Fast** `gpt-5.4-nano` / 4 s / 4 · **Balanced** (default, recommended) `gpt-4o-mini` / 6 s / 4 · **Best quality** `gpt-4o` / 9 s / 4 ·
+  **Custom** any model name, 8 s / 4 (use it for non-OpenAI servers). Reasoning models get `max_completion_tokens` + a low
+  `reasoning_effort`; others `temperature 0`.
+  For full-track Hip-Hop / 华语 sets the rules build a small menu per pair: up to 3 out-points that sit on the phrase grid
+  (the rule's own pick is always `c1`) × the transition types the decision table accepts, max 8; echo-out / drumless-reset
+  are only offered when the pair is not beat-synced (tempo gap > 2.5 %), at the planned reset slot or when the rules chose
+  them. Each pair carries compact context (set position, recent types, tempo gap/family, key fit, target bars) and each
+  candidate its cut point, bars, play time, whether A's vocal runs through the cut and how B enters. The prompt is
+  rules-first ("keep c1 unless a reference-DJ rule clearly prefers another"). The model only returns ids (JSON mode), and the
+  rules re-check the pick when it is used (tempo, grid, no two 808s / vocals stacked, never through a hook). Rolling cache:
+  the next ≤ 5 pairs, asked 4 at a time, keyed by the pair with a small tolerance on start/tempo, so a reorder re-asks only
+  what changed. Transitions never wait: a hit is used, a miss plays the rules plan. Errors, bad keys, timeouts or malformed /
+  unknown ids fall back to the rules (15 s → 2 min back-off). Each mix's source (`rules`, `cache`, `llm`) is in
+  `NEONDJ.S.mixLog[].src`, requests in `NEONDJ.LLM.log`, tokens in `NEONDJ.LLM.tok`.
+  **CORS**: the browser calls the provider directly. OpenAI allows it from any origin (incl. the github.io page), but its
+  401 for a wrong key carries no CORS header, so a bad key shows as "network/CORS error". Providers without CORS headers
+  (and plain-`http` URLs from the `https` page, except localhost) are blocked by the browser; then the rules just run.
+  The NetEase Worker proxy is GET-only and is deliberately not used for API keys.
+  **Benchmark (real OpenAI API, Nov 2026, frozen pools: Hip-Hop 31 tracks / 华语 28 tracks, 30-track sets).** Score = 100 minus
+  penalties from the reference-DJ analysis (cut through a hook, off-phrase cut, B not on vocal/downbeat, stacked vocals/808s,
+  misplaced resets/echoes, 3× same type, long blends > 15 %, cut share, play-length arc); rules on the same pairs = 91.4 / 76.9.
+
+  | model | Hip-Hop | 华语 | p50 / p95 per call | cost per set |
+  |---|---|---|---|---|
+  | gpt-4o-mini (Balanced) | **92.3** | **79.5** | 1.1–1.4 s / 1.3–2.6 s | $0.002 |
+  | gpt-4o (Best quality) | 91.0 | 79.1 | 0.9–1.0 s / 1.2–1.7 s | $0.03 |
+  | gpt-4.1 | 90.9 | 76.6 | 0.9 s / 1.0 s | $0.024 |
+  | gpt-4.1-mini | 90.1 | 76.3 | 1.0 s / 1.2–1.5 s | $0.005 |
+  | gpt-5.4-nano (Fast) | 91.2 | 76.6 | 0.8 s / 0.9–1.5 s | $0.003 |
+  | gpt-5.4-mini | 90.4 | 75.0 | 1.0 s / 1.2–1.3 s | $0.01 |
+  | gpt-5.4 | 88.9 | 73.4 | 1.3–1.4 s / 1.4–2.1 s | $0.033 |
+  | gpt-5-mini | 88.3 | 77.2 | 1.2 s / 1.3–1.5 s | $0.0035 |
+  | gpt-5-nano | 91.5 | 78.1 | 0.9–1.0 s / 1.0–1.8 s | $0.0007 (drops ids for some pairs) |
+  | gpt-5 | too slow (p95 > 20 s) | – | | |
+
+  Before tuning (first prompt, unpruned menu) the same models scored 67–84 on Hip-Hop (gpt-4o-mini 66.7: echo-outs on
+  beat-synced pairs). gpt-4.1-nano and o4-mini are not available on the API any more. The score is our own heuristic, not a
+  listening test; Fast mostly keeps the rule pick (≈ rules quality).
 - **NetEase proxy**: the hosted site uses a built-in proxy; paste your own Worker URL (see `providers/proxy/README.md`) and
   Save to override it — Muse checks it. Clear + Save goes back to the built-in one (opened from file:// there is none). Stored in `localStorage['neondj.provsettings']`.
 

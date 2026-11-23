@@ -283,6 +283,7 @@ details.ai[open] summary{margin-bottom:10px}
 details.ai .tog{margin-bottom:4px}
 details.ai .aifields{display:grid;grid-template-rows:1fr;transition:grid-template-rows .25s ease,opacity .25s ease}
 details.ai .aifields>div{min-height:0;overflow:hidden}
+details.ai:has(#aiPreset option[value=custom]:not(:checked)) #aiModel{display:none}
 details.ai:has(#aiOn:not(:checked)) .aifields{grid-template-rows:0fr;opacity:0;pointer-events:none}
 details.ai .lbl{margin-top:14px}
 .inrow{display:flex;gap:8px;align-items:center}

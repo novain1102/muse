@@ -1177,7 +1177,7 @@ function planOut(tr, start, x, opts = {}) {
   }
   const ok = cands.filter(c => !c.through);
   if (ok.length) { const b = ok.reduce((a, c) => c.s > a.s + 1e-9 ? c : a), why = c => c.brk ? 'break' : c.after ? 'after-highlight' : c.vEnd ? 'vocal-end' : c.phr ? 'phrase' : 'bar';
-    const alts = ok.slice().sort((a, c) => c.s - a.s).slice(0, 4).map(c => ({ P: c.P, L: c.L, s: c.s, reason: why(c), vThru: c.vThru }));   // menu for the optional LLM layer
+    const alts = ok.slice().sort((a, c) => c.s - a.s).slice(0, 4).map(c => ({ P: c.P, L: c.L, s: c.s, reason: why(c), vThru: c.vThru, phr: c.phr }));   // menu for the optional LLM layer
     return { ...b, reason: why(b), map: true, target: T, alts }; }
   // everything in range sits inside a highlight: hold until it ends, else let the song play out
   for (let k = barIdx(st, start + Lmax * hb) + 1; barT(st, k) <= cap; k++) if (!(hiAt(k - 1) && hiAt(k))) return { P: barT(st, k), k, L: (barT(st, k) - start) / hb, reason: 'held-past-highlight', map: true, target: T };
@@ -1247,81 +1247,124 @@ function decideMix(A, rateA, P, Bt, info = {}) {
  * the pick when it is used. Rolling cache: decisions for the next few pairs (≤ 5 ahead, 3–4 per request), keyed by the exact
  * chain state (A, B, A's start, A's rate), so a changed order / pick simply misses and is re-asked. Transitions never wait:
  * a cache hit is used, a miss plays the rules plan while the model answers in the background. Any failure → rules. */
-const LLM = { cache: new Map(), busy: false, fails: 0, until: 0, last: null, log: [], req: 0 };
+const LLM = { cache: new Map(), busy: false, fails: 0, until: 0, last: null, log: [], req: 0, tok: { in: 0, out: 0, calls: 0 } };
+/* strategy presets (Advanced → LLM assist): model + timeout + batch per priority; Custom uses the model field.
+   Chosen from a real-API benchmark on frozen Hip-Hop and 华语 pools (see docs/DETAILS.md): gpt-4o-mini scored best and beat the rules on both,
+   gpt-5.4-nano answers fastest but mostly keeps the rule pick, gpt-4o is the larger model for Best quality. gpt-4.1-nano is retired upstream. */
+const LLM_PRESETS = {
+  fast:     { model: 'gpt-5.4-nano', timeout: 4000, batch: 4, ahead: 5 },
+  balanced: { model: 'gpt-4o-mini',  timeout: 6000, batch: 4, ahead: 5 },
+  best:     { model: 'gpt-4o',       timeout: 9000, batch: 4, ahead: 5 },
+};
 const llmCfg = () => {
   const on = opt('aiOn') && opt('aiOn').checked, base = ((opt('aiBase') && opt('aiBase').value) || 'https://api.openai.com/v1').trim().replace(/\/+$/, '');
-  const key = ((opt('aiKey') && opt('aiKey').value) || '').trim(), model = ((opt('aiModel') && opt('aiModel').value) || 'gpt-4o-mini').trim();
-  return { on: !!(on && base && model && (key || !/api\.openai\.com/.test(base))), base, key, model };
+  const key = ((opt('aiKey') && opt('aiKey').value) || '').trim(), pv = (opt('aiPreset') && opt('aiPreset').value) || 'balanced';
+  const pr = LLM_PRESETS[pv] || { ...LLM_PRESETS.balanced, model: ((opt('aiModel') && opt('aiModel').value) || 'gpt-4o-mini').trim(), timeout: 8000 };
+  return { on: !!(on && base && pr.model && (key || !/api\.openai\.com/.test(base))), base, key, preset: pv, ...pr };
 };
-const LLM_TIMEOUT = 6000, LLM_AHEAD = 5, LLM_BATCH = 4;
 const llmStart = () => S.segCue && S.live && S.segCue.id === S.live.track.id ? S.segCue.t : (S.segStart || 0);   // where the live track came in (its planned cue)
-const llmKey = (A, B, start, rate) => `${A.id}>${B.id}@${start.toFixed(1)}/${rate.toFixed(3)}`;
+const llmKey = (A, B) => `${A.id}>${B.id}`;
+/* a cached pick still fits if A came in within 4 half-time bars of the start it was planned for, at about the same tempo */
+const llmFits = (hit, A, start, rate) => { const st = stOf(A); return !!(hit && st && Math.abs(start - hit.start) <= 4 * st.hbar + 0.05 && Math.abs(rate / hit.rate - 1) <= 0.02); };
+const llmReasoning = m => /^(o\d|gpt-5|gpt-6)/i.test(m);   // reasoning models: max_completion_tokens, no temperature, low effort
 async function llmChat(cfg, messages, json = true) {
-  const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), LLM_TIMEOUT);
+  const tmo = cfg.timeout || 6000, ctl = new AbortController(), to = setTimeout(() => ctl.abort(), tmo), t0 = performance.now();
   try {
     const headers = { 'Content-Type': 'application/json' }; if (cfg.key) headers.Authorization = 'Bearer ' + cfg.key;
-    const body = { model: cfg.model, temperature: 0.3, max_tokens: 400, messages }; if (json) body.response_format = { type: 'json_object' };
-    const r = await fetch(cfg.base + '/chat/completions', { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
+    const body = { model: cfg.model, messages };
+    if (llmReasoning(cfg.model)) { body.max_completion_tokens = 4000; body.reasoning_effort = cfg.effort || (/^gpt-5(-|$)/i.test(cfg.model) ? 'minimal' : /^o\d/i.test(cfg.model) ? 'low' : 'none'); } else { body.temperature = 0; body.max_tokens = 500; }
+    if (json) body.response_format = { type: 'json_object' };
+    let r;
+    for (let k = 0; k < 2; k++) {   // one retry without a parameter the provider rejects (e.g. reasoning_effort / response_format)
+      r = await fetch(cfg.base + '/chat/completions', { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
+      if (r.ok || r.status !== 400 || k) break;
+      const t = await r.clone().text().catch(() => ''), m = /'?(reasoning_effort|response_format|temperature|max_tokens)'?/.exec(t); if (!m) break;
+      if (m[1] === 'max_tokens') { delete body.max_tokens; body.max_completion_tokens = 4000; } else delete body[m[1]];
+    }
     if (!r.ok) { const t = await r.text().catch(() => ''); const e = new Error(`HTTP ${r.status}`); e.status = r.status; e.body = t.slice(0, 200); throw e; }
     const j = await r.json(), c = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    if (typeof c !== 'string') throw new Error('no message content');
-    return JSON.parse(c.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ''));
-  } catch (e) { if (e && e.name === 'AbortError') throw new Error('timeout ' + LLM_TIMEOUT + ' ms'); throw e; }
+    const u = j && j.usage; if (u) { LLM.tok.in += u.prompt_tokens || 0; LLM.tok.out += u.completion_tokens || 0; } LLM.tok.calls++;
+    if (typeof c !== 'string' || !c.trim()) throw new Error('no message content');
+    const data = JSON.parse(c.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ''));
+    Object.defineProperty(data, '_meta', { value: { ms: Math.round(performance.now() - t0), usage: u || null }, enumerable: false });
+    return data;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('timeout ' + tmo + ' ms');
+    if (e instanceof TypeError) throw new Error('network/CORS error' + (/api\.openai\.com/.test(cfg.base) ? ' (check the API key: OpenAI answers a bad key without CORS headers)' : ' (server unreachable or not sending CORS headers)'));
+    throw e;
+  }
   finally { clearTimeout(to); }
 }
-/* the candidate menu for one pair: A from `start` at `rate`, into B */
+/* the candidate menu for one pair: A from `start` at `rate`, into B. Ranked: c1 is the rules' own choice. Pruned to what the
+ * reference DJ would do: echo / drumless reset only to mask a real tempo change (or in the reset slot), never when the pair
+ * syncs; out-points only if they score close to the best phrase end. */
 function llmMenu(A, B, start, rate, x, rest, info) {
   const sa = stOf(A), sb = stOf(B); if (!sa || !sb || rest <= 0) return null;
   const out = planOut(A, start, x, { now: start + 1, rest, lead: 4 * 60 / (A.bpm || 120) + 1 }); if (!out || !out.alts) return null;
-  const cands = []; const seen = new Set();
-  out.alts.slice(0, 3).forEach((o, oi) => {
+  const best = out.alts[0].s, outs = out.alts.filter((o, k) => k === 0 || (o.phr && o.s >= best - 1.2)).slice(0, 3);   // alternatives only on the phrase grid
+  const cands = []; const seen = new Set(); let ctx = null;
+  outs.forEach((o, oi) => {
     const base = decideMix(A, rate, o.P, B, info);
-    [base.type, ...base.allowed.filter(t => t !== base.type)].forEach(t => {
+    if (!ctx) ctx = { tempo_gap_pct: base.gap, tempo_family: base.fam, beat_synced: base.sync, key_ok: base.keyOk, b_slot: B._slot || null, last_change: !!info.lastChange, target_bars: +targetHb(A, x, rest).toFixed(0) };
+    const masked = !base.sync && !(base.fam === '1:1' && base.gap <= 2.5);
+    const ok = t => t === base.type || (t === 'echoOut' ? masked || info.lastChange : t === 'drumlessReset' ? info.reset || masked : true);
+    [base.type, ...base.allowed.filter(t => t !== base.type)].filter(ok).forEach(t => {
       const p = t === base.type ? base : decideMix(A, rate, o.P, B, { ...info, force: t }); if (p.type !== t) return;
-      const k = o.P.toFixed(2) + t; if (seen.has(k) || cands.length >= 9) return; seen.add(k);
+      const k = o.P.toFixed(2) + t; if (seen.has(k) || cands.length >= 8) return; seen.add(k);
       cands.push({ id: 'c' + (cands.length + 1), P: o.P, type: t, rule: oi === 0 && t === base.type, pair: p,
-        d: { out_s: +o.P.toFixed(1), play_s: +((o.P - start) / rate).toFixed(0), bars: +o.L.toFixed(1), out_at: o.reason, rapping_through: !!o.vThru, type: t, b_in_s: +p.cue.toFixed(1), b_in: p.cueKind, rules_default: oi === 0 && t === base.type || undefined } });
+        d: { type: t, cut_at: o.reason, bars: +o.L.toFixed(0), play_s: +((o.P - start) / rate).toFixed(0), a_vocal_runs_through_cut: !!o.vThru || undefined, b_enters: p.cueKind, b_enter_s: +p.cue.toFixed(1) } });
     });
   });
-  return cands.length ? { out, cands } : null;
+  return cands.length ? { out, cands, ctx } : null;
 }
 const llmTrack = t => ({ title: (t.title || '').slice(0, 48), artist: (t.artist || '').slice(0, 32), bpm: t.bpm ? +t.bpm.toFixed(1) : null, key: (t.cam && t.cam.s) || null, energy: t.energy != null ? +t.energy.toFixed(2) : null });
+function llmPrompt(ask, ctx) {
+  const sys = [
+    'You choose transitions for a hip-hop / Chinese-rap DJ set. Each pair lists rule-checked candidates, ranked: c1 is the rule engine\'s choice.',
+    'Pick c1 unless a rule below clearly prefers another candidate of the same pair. Reference DJ rules:',
+    '1. Cut A where a vocal line or phrase ends (cut_at vocal-end / break / after-highlight beat plain phrase); never mid-hook.',
+    '2. B enters on a downbeat right before its first vocal or hook (b_enters vocal / drop); start B from its intro only for a reset.',
+    '3. Mostly tight cuts: phraseCut, bassSwap, dropSwap, brake, ratioCut (>= 80 % of the set). longBlend at most 15 %, only same key and both sides instrumental.',
+    '4. When the pair is beat_synced, cut on the beat; echoOut / drumlessReset are only for masking a tempo change > 2.5 % or the planned reset slot (b_slot "reset", ~40-50 % of the set).',
+    '5. Play length: whole phrases of 12, 16 or 24 half-time bars; prefer bars close to target_bars (it grows toward the end of the set).',
+    '6. Variety comes from the music: avoid the same type 3 times in a row (see recent), but never trade a clean cut for variety.',
+    'Answer JSON only, exactly one pick for every pair in answer_for: {"picks":[{"pair":"p1","id":"c1"},{"pair":"p2","id":"c1"}]}'].join('\n');
+  const user = { set_position: +(ctx.x || 0).toFixed(2), recent: ctx.last || [], answer_for: ask.map((b, k) => 'p' + (k + 1)),
+    pairs: ask.map((b, k) => ({ pair: 'p' + (k + 1), from: llmTrack(b.A), to: llmTrack(b.B), ...(b.m.ctx || {}), candidates: b.m.cands.map(c => ({ id: c.id, ...c.d })) })) };
+  return [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }];
+}
+/* the model's reply → [{ b, c }] for known ids only (unknown ids leave that pair on the rules); throws if nothing usable */
+function llmParse(res, ask) {
+  const picks = res && Array.isArray(res.picks) ? res.picks : null; if (!picks) throw new Error('malformed reply (no picks[])');
+  const got = [];
+  ask.forEach((b, k) => { const p = picks.find(q => q && String(q.pair) === 'p' + (k + 1)), c = p && b.m.cands.find(c => c.id === String(p.id)); if (c) got.push({ b, c, k }); });
+  if (!got.length) throw new Error('no valid candidate ids');
+  return got;
+}
 /* walk the chain from the live track: cached picks advance it, misses are batched (3–4) and asked in the background */
 function llmPrefetch(why = '') {
   const cfg = llmCfg(); if (!cfg.on || !shortBlend() || fullSongs() || LLM.busy || performance.now() < LLM.until) return;
   const d = S.live; if (!d || !d.track || S.idx < 0) return;
   const endless = opt('endless').checked; let i = S.idx, A = d.track, start = llmStart(), rate = d.lockRate || 1;
   const batch = [];
-  for (let h = 0; h < LLM_AHEAD; h++) {
+  for (let h = 0; h < cfg.ahead; h++) {
     const j = nextIdx(i + 1); if (j < 0) break; const B = S.set[j];
     const rest = endless ? 99 : S.set.slice(i + 1).filter(t => !t.bad).length, info = { x: arcX(i + 1), reset: B._slot === 'reset', lastChange: !endless && nextIdx(j + 1) < 0 };
-    const key = llmKey(A, B, start, rate), hit = LLM.cache.get(key);
+    const key = llmKey(A, B), hit0 = LLM.cache.get(key), hit = llmFits(hit0, A, start, rate) ? hit0 : null;
     let next;
     if (hit) next = hit.pair;
-    else { const m = llmMenu(A, B, start, rate, arcX(i), rest, info); if (!m) break; batch.push({ key, A, B, m, h }); next = m.cands[0].pair; }
+    else { const m = llmMenu(A, B, start, rate, arcX(i), rest, info); if (!m) break; batch.push({ key, A, B, m, h, start, rate }); next = m.cands[0].pair; }
     i = j; start = next.cue; rate = next.lockB; A = B;
   }
   // small batches: ask when 3+ are missing, or when the live / next pair has nothing yet
-  if (!batch.length || (batch.length < 3 && batch[0].h > 1)) return;
-  const ask = batch.slice(0, LLM_BATCH); LLM.busy = true; const t0 = performance.now(), rid = ++LLM.req;
-  const sys = 'You are the transition brain of a hip-hop / Chinese rap DJ set. For each pair choose exactly one candidate id from its list. ' +
-    'Every candidate is already rule-checked (beat grid, tempo, no two 808s or two vocals stacked). Prefer: clean phrase / vocal-line ends, B entering just before its first vocal, ' +
-    'short tight cuts in dense rap, a breath (drumless reset / echo) for big tempo or mood changes, variety (avoid the same type 3 times in a row), longer plays near the end of the set. ' +
-    'Reply with JSON only: {"picks":[{"pair":"p1","id":"c2"}]}';
-  const user = { set_position: +arcX(S.idx).toFixed(2), last_types: (S.mixLog || []).slice(-3).map(e => e.script),
-    pairs: ask.map((b, k) => ({ pair: 'p' + (k + 1), from: llmTrack(b.A), to: llmTrack(b.B), candidates: b.m.cands.map(c => ({ id: c.id, ...c.d })) })) };
+  if (!batch.length || (batch.length < Math.min(3, cfg.batch) && batch[0].h > 1)) return;
+  const ask = batch.slice(0, cfg.batch); LLM.busy = true; const t0 = performance.now(), rid = ++LLM.req;
   const entry = { rid, at: Date.now(), why, pairs: ask.length, ok: false };
-  llmChat(cfg, [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify(user) }])
+  llmChat(cfg, llmPrompt(ask, { x: arcX(S.idx), last: (S.mixLog || []).slice(-3).map(e => e.script) }))
     .then(res => {
-      const picks = res && Array.isArray(res.picks) ? res.picks : null; if (!picks) throw new Error('malformed reply (no picks[])');
-      let n = 0;
-      ask.forEach((b, k) => {
-        const p = picks.find(q => q && String(q.pair) === 'p' + (k + 1)), c = p && b.m.cands.find(c => c.id === String(p.id));
-        if (!c) return;   // unknown id → that pair stays on the rules
-        LLM.cache.set(b.key, { P: c.P, type: c.type, id: c.id, rule: c.rule, pair: c.pair, at: performance.now(), rid }); n++;
-      });
-      if (!n) throw new Error('no valid candidate ids');
-      entry.ok = true; entry.n = n; LLM.fails = 0;
+      const got = llmParse(res, ask); let n = 0;
+      got.forEach(({ b, c }) => { LLM.cache.set(b.key, { P: c.P, type: c.type, id: c.id, rule: c.rule, pair: c.pair, start: b.start, rate: b.rate, at: performance.now(), rid }); n++; });
+      entry.ok = true; entry.n = n; entry.rej = ask.length - n; LLM.fails = 0; if (res._meta) { entry.api = res._meta.ms; entry.usage = res._meta.usage; }
       if (LLM.cache.size > 60) [...LLM.cache.keys()].slice(0, LLM.cache.size - 60).forEach(k => LLM.cache.delete(k));
     })
     .catch(e => { entry.err = String(e.message || e).slice(0, 120); LLM.fails++; LLM.until = performance.now() + Math.min(120000, 15000 * LLM.fails); console.warn('[llm] fallback to rules:', entry.err); })
@@ -1335,7 +1378,7 @@ function llmPrefetch(why = '') {
 /* at plan time: the cached pick for the live pair, re-validated by the rules now (else null → rules) */
 function llmUse(A, B, rate, info, now, lead) {
   const cfg = llmCfg(); if (!cfg.on || !B || !S.live) return null;
-  const hit = LLM.cache.get(llmKey(A, B, llmStart(), S.live.lockRate || 1)); if (!hit) return null;
+  const hit = LLM.cache.get(llmKey(A, B)); if (!llmFits(hit, A, llmStart(), S.live.lockRate || 1)) return null;
   const st = stOf(A), M = barMap(A), cap = (A.dur || 180) - 4; if (!st) return null;
   if (!(hit.P > now + lead && hit.P <= cap && hit.P - S.segStart >= 8 * st.hbar)) return null;           // still ahead, not too short
   const k = barIdx(st, hit.P + 0.05); if (M && k > 0 && k < M.nb && M.hi[k - 1] && M.hi[k]) return null;  // never through a hook / drop
@@ -2132,7 +2175,7 @@ function buildChips() {
 function buildSources() { const cur = opt('source').value; opt('source').innerHTML = Providers.usable().map(p => `<option value="${esc(p.id)}" title="${esc(p.hint || '')}"${p.id === Providers.defaultId ? ' selected' : ''}>${esc(p.label)}</option>`).join(''); if (cur && Providers.usable().some(p => p.id === cur)) opt('source').value = cur; }
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
-const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiBase', 'aiModel'];
+const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiPreset', 'aiBase', 'aiModel'];
 function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.perTrack != null && o.perTrack !== '0') o.perTrack = 'auto';   /* old fixed lengths (1:30 / 2:30 / 3:30) -> phrase-based */ if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
 function saveOpts() { const o = {}; PERSIST.forEach(k => { const el = opt(k); if (el) o[k] = el.type === 'checkbox' ? el.checked : el.value; }); localStorage.setItem('neondj.opts', JSON.stringify(o)); }
 
@@ -2592,7 +2635,7 @@ function init() {
   document.addEventListener('change', e => { if (e.target.closest('.gen, .transport, .pads')) saveOpts(); });
   $('#aiKey').value = localStorage.getItem('neondj.aikey') || '';
   $('#aiKey').addEventListener('change', e => { e.target.value ? localStorage.setItem('neondj.aikey', e.target.value) : localStorage.removeItem('neondj.aikey'); });
-  ['aiOn', 'aiBase', 'aiKey', 'aiModel'].forEach(id => $('#' + id).addEventListener('change', () => { saveOpts(); LLM.cache.clear(); LLM.fails = 0; LLM.until = 0; if (llmCfg().on) llmPrefetch('settings'); }));
+  ['aiOn', 'aiPreset', 'aiBase', 'aiKey', 'aiModel'].forEach(id => $('#' + id).addEventListener('change', () => { saveOpts(); LLM.cache.clear(); LLM.fails = 0; LLM.until = 0; if (llmCfg().on) llmPrefetch('settings'); }));
   $('#prompt').addEventListener('keydown', e => { if (e.key === 'Enter') build(); });
   // NetEase proxy (Advanced): the NetEase source only appears in the Source menu once a proxy URL is saved
   $('#neteaseProxy').value = Providers.settings.get('neteaseProxy');
@@ -2605,7 +2648,7 @@ function init() {
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
   });
-  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, LLM, llmCfg, llmPrefetch, llmMenu, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
+  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, LLM, LLM_PRESETS, __targetHb: targetHb, llmCfg, llmPrefetch, llmMenu, llmPrompt, llmParse, llmChat, llmUse, planOut, decideMix, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
     structureOf, cueFor, planOut, decideMix, tempoFam, arcX, stOf, beatOk, isZh, energyOf, markTiers, computeTransAt, onPhrase, vocalIn, keyDist });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();
