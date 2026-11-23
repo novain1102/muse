@@ -1248,18 +1248,16 @@ function decideMix(A, rateA, P, Bt, info = {}) {
  * chain state (A, B, A's start, A's rate), so a changed order / pick simply misses and is re-asked. Transitions never wait:
  * a cache hit is used, a miss plays the rules plan while the model answers in the background. Any failure → rules. */
 const LLM = { cache: new Map(), busy: false, fails: 0, until: 0, last: null, log: [], req: 0, tok: { in: 0, out: 0, calls: 0 } };
-/* strategy presets (Advanced → LLM assist): model + timeout + batch per priority; Custom uses the model field.
-   Chosen from a real-API benchmark on frozen Hip-Hop and 华语 pools (see docs/DETAILS.md): gpt-4o-mini scored best and beat the rules on both,
-   gpt-5.4-nano answers fastest but mostly keeps the rule pick, gpt-4o is the larger model for Best quality. gpt-4.1-nano is retired upstream. */
+/* LLM assist mode (Advanced → LLM assist): Default = gpt-4o-mini (best score / cost in the real-API benchmark, see docs/DETAILS.md);
+   Custom = any model typed in the model field (use it for other providers / OpenAI-compatible servers). */
 const LLM_PRESETS = {
-  fast:     { model: 'gpt-5.4-nano', timeout: 4000, batch: 4, ahead: 5 },
-  balanced: { model: 'gpt-4o-mini',  timeout: 6000, batch: 4, ahead: 5 },
-  best:     { model: 'gpt-4o',       timeout: 9000, batch: 4, ahead: 5 },
+  default: { model: 'gpt-4o-mini', timeout: 6000, batch: 4, ahead: 5 },
+  custom:  { timeout: 8000, batch: 4, ahead: 5 },
 };
 const llmCfg = () => {
   const on = opt('aiOn') && opt('aiOn').checked, base = ((opt('aiBase') && opt('aiBase').value) || 'https://api.openai.com/v1').trim().replace(/\/+$/, '');
-  const key = ((opt('aiKey') && opt('aiKey').value) || '').trim(), pv = (opt('aiPreset') && opt('aiPreset').value) || 'balanced';
-  const pr = LLM_PRESETS[pv] || { ...LLM_PRESETS.balanced, model: ((opt('aiModel') && opt('aiModel').value) || 'gpt-4o-mini').trim(), timeout: 8000 };
+  const key = ((opt('aiKey') && opt('aiKey').value) || '').trim(), pv = (opt('aiPreset') && opt('aiPreset').value) === 'custom' ? 'custom' : 'default';
+  const pr = pv === 'custom' ? { ...LLM_PRESETS.custom, model: ((opt('aiModel') && opt('aiModel').value) || '').trim() } : LLM_PRESETS.default;
   return { on: !!(on && base && pr.model && (key || !/api\.openai\.com/.test(base))), base, key, preset: pv, ...pr };
 };
 const llmStart = () => S.segCue && S.live && S.segCue.id === S.live.track.id ? S.segCue.t : (S.segStart || 0);   // where the live track came in (its planned cue)
@@ -2176,7 +2174,7 @@ function buildSources() { const cur = opt('source').value; opt('source').innerHT
 const selected = id => $$(`#${id} .chip.on`).map(c => c.dataset.k);
 function saveSel() { localStorage.setItem('neondj.sel', JSON.stringify({ g: selected('genres'), m: selected('moods') })); }
 const PERSIST = ['setLen', 'perTrack', 'order', 'source', 'taste', 'xfLen', 'autoFx', 'tempoSync', 'skipIntro', 'endless', 'fxAmt', 'aiOn', 'aiPreset', 'aiBase', 'aiModel'];
-function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.perTrack != null && o.perTrack !== '0') o.perTrack = 'auto';   /* old fixed lengths (1:30 / 2:30 / 3:30) -> phrase-based */ if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
+function loadOpts() { const o = JSON.parse(localStorage.getItem('neondj.opts') || '{}'); if (o.perTrack != null && o.perTrack !== '0') o.perTrack = 'auto';   /* old fixed lengths (1:30 / 2:30 / 3:30) -> phrase-based */ if (o.aiPreset != null) o.aiPreset = o.aiPreset === 'custom' ? 'custom' : 'default';   /* old Fast / Balanced / Best quality presets -> Default */ if (o.fxAmt) o.fxAmt = ({ subtle: 'smooth', normal: 'club' })[o.fxAmt] || o.fxAmt; /* old Auto-FX values -> Hype */ PERSIST.forEach(k => { const el = opt(k); if (!el || o[k] == null) return; el.type === 'checkbox' ? el.checked = o[k] : el.value = o[k]; }); opt('xfLenVal').textContent = xfLen() + 's'; }
 function saveOpts() { const o = {}; PERSIST.forEach(k => { const el = opt(k); if (el) o[k] = el.type === 'checkbox' ? el.checked : el.value; }); localStorage.setItem('neondj.opts', JSON.stringify(o)); }
 
 async function build() {

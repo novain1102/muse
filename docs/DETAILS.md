@@ -189,11 +189,12 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
   the current track. Endless mode digs more tracks before the set runs out.
 
 ## Advanced
-- **LLM assist** (optional, off by default): toggle + strategy preset + base URL (any OpenAI-compatible `…/v1`) + API key
-  (+ model for Custom). Stored in this browser (`neondj.opts`, key only in `neondj.aikey`). Presets (model / timeout / pairs per call):
-  **Fast** `gpt-5.4-nano` / 4 s / 4 · **Balanced** (default, recommended) `gpt-4o-mini` / 6 s / 4 · **Best quality** `gpt-4o` / 9 s / 4 ·
-  **Custom** any model name, 8 s / 4 (use it for non-OpenAI servers). Reasoning models get `max_completion_tokens` + a low
-  `reasoning_effort`; others `temperature 0`.
+- **LLM assist** (optional, off by default; Advanced, below Generate & Play): toggle + mode + base URL (any OpenAI-compatible
+  `…/v1`) + API key. Two modes: **Default** = `gpt-4o-mini`, 6 s timeout, 4 pairs per call, 5 tracks ahead (the best score and
+  best value in the benchmark below) · **Custom** = shows a model-name field, any model (use it for other models or
+  OpenAI-compatible servers), 8 s timeout, 4 pairs per call, 5 ahead. Settings are stored in this browser (`neondj.opts`;
+  key only in `neondj.aikey`); the old Fast / Balanced / Best quality choices load as Default, Custom stays Custom.
+  Reasoning models get `max_completion_tokens` + a low `reasoning_effort`; others `temperature 0`.
   For full-track Hip-Hop / 华语 sets the rules build a small menu per pair: up to 3 out-points that sit on the phrase grid
   (the rule's own pick is always `c1`) × the transition types the decision table accepts, max 8; echo-out / drumless-reset
   are only offered when the pair is not beat-synced (tempo gap > 2.5 %), at the planned reset slot or when the rules chose
@@ -215,11 +216,11 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
 
   | model | Hip-Hop | 华语 | p50 / p95 per call | cost per set |
   |---|---|---|---|---|
-  | gpt-4o-mini (Balanced) | **92.3** | **79.5** | 1.1–1.4 s / 1.3–2.6 s | $0.002 |
-  | gpt-4o (Best quality) | 91.0 | 79.1 | 0.9–1.0 s / 1.2–1.7 s | $0.03 |
+  | gpt-4o-mini (Default) | **92.3** | **79.5** | 1.1–1.4 s / 1.3–2.6 s | $0.002 |
+  | gpt-4o | 91.0 | 79.1 | 0.9–1.0 s / 1.2–1.7 s | $0.03 |
   | gpt-4.1 | 90.9 | 76.6 | 0.9 s / 1.0 s | $0.024 |
   | gpt-4.1-mini | 90.1 | 76.3 | 1.0 s / 1.2–1.5 s | $0.005 |
-  | gpt-5.4-nano (Fast) | 91.2 | 76.6 | 0.8 s / 0.9–1.5 s | $0.003 |
+  | gpt-5.4-nano | 91.2 | 76.6 | 0.8 s / 0.9–1.5 s | $0.003 |
   | gpt-5.4-mini | 90.4 | 75.0 | 1.0 s / 1.2–1.3 s | $0.01 |
   | gpt-5.4 | 88.9 | 73.4 | 1.3–1.4 s / 1.4–2.1 s | $0.033 |
   | gpt-5-mini | 88.3 | 77.2 | 1.2 s / 1.3–1.5 s | $0.0035 |
@@ -228,7 +229,7 @@ Everything is AudioParam automation, so knobs, pads and the FX lamps show it; th
 
   Before tuning (first prompt, unpruned menu) the same models scored 67–84 on Hip-Hop (gpt-4o-mini 66.7: echo-outs on
   beat-synced pairs). gpt-4.1-nano and o4-mini are not available on the API any more. The score is our own heuristic, not a
-  listening test; Fast mostly keeps the rule pick (≈ rules quality).
+  listening test.
 - **NetEase proxy**: the hosted site uses a built-in proxy; paste your own Worker URL (see `providers/proxy/README.md`) and
   Save to override it — Muse checks it. Clear + Save goes back to the built-in one (opened from file:// there is none). Stored in `localStorage['neondj.provsettings']`.
 

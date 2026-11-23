@@ -82,15 +82,13 @@
       <summary>Advanced</summary>
       <label class="tog" title="Optional, off by default. An OpenAI-compatible model picks among rule-checked transition candidates for the next few tracks (cached ahead; falls back to the rules on any error) and adds a few search keywords. Settings stay in this browser."><input id="aiOn" type="checkbox" /><span>LLM assist</span></label>
       <div class="aifields"><div>
-        <select id="aiPreset" class="inp" title="Fast: gpt-5.4-nano, lowest latency · Balanced (recommended): gpt-4o-mini · Best quality: gpt-4o, longer timeout · Custom: any model / any OpenAI-compatible server">
-          <option value="fast">Fast · gpt-5.4-nano</option>
-          <option value="balanced" selected>Balanced · gpt-4o-mini</option>
-          <option value="best">Best quality · gpt-4o</option>
-          <option value="custom">Custom</option>
+        <select id="aiPreset" class="inp" title="Default: gpt-4o-mini (recommended) · Custom: type any model name">
+          <option value="default" selected>Default · gpt-4o-mini</option>
+          <option value="custom">Custom model</option>
         </select>
         <input id="aiBase" class="inp" type="url" value="https://api.openai.com/v1" placeholder="Base URL" title="OpenAI-compatible base URL (…/v1)" autocomplete="off" spellcheck="false" />
         <input id="aiKey" class="inp" type="password" placeholder="API key" title="API key" autocomplete="off" />
-        <input id="aiModel" class="inp" type="text" value="gpt-4o-mini" placeholder="Model" title="Model (Custom)" autocomplete="off" spellcheck="false" />
+        <input id="aiModel" class="inp" type="text" value="gpt-4o-mini" placeholder="Model name, e.g. gpt-4.1" title="Model name (Custom)" autocomplete="off" spellcheck="false" />
       </div></div>
       <label class="lbl" for="neteaseProxy" title="NetEase Cloud Music goes through a small proxy — a built-in one is used on the hosted site; paste your own here to override (providers/proxy/README.md)">NetEase proxy</label>
       <div class="inrow"><input id="neteaseProxy" class="inp" type="url" placeholder="built-in proxy (optional override)" autocomplete="off" /><button id="proxySave" class="btn mini" type="button">Save</button></div>
