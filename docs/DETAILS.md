@@ -16,7 +16,7 @@ Pick one in **Source**. Sources are pluggable (`providers/`, see `../providers/R
 | Source | What plays | Needs |
 |---|---|---|
 | **Audius** (default) | Full tracks by independent artists, BPM + key | nothing |
-| **iTunes previews** | 30 s previews (Audius's fallback) | nothing |
+| **iTunes previews** | 30 s previews (only when picked as Source) | nothing |
 | **Kugou 酷狗** | Full songs Kugou streams for free (standard quality); VIP-only songs skipped | nothing — called straight from the page |
 | **QQ Music QQ音乐** | Free songs only, **in mainland China only** (QQ hands out no stream keys elsewhere) | nothing; outside China it falls back to Audius |
 | **NetEase 网易云** | Free full songs; VIP/paid, region-blocked and 30 s trial clips skipped | a small proxy (Cloudflare Worker, `providers/proxy/`): a built-in one on the hosted site (`muse-proxy…workers.dev`, only answers novain1102.github.io and localhost:8000); your own URL under Advanced overrides it |
@@ -36,6 +36,10 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    flux). Per bar on the beat grid that gives a robust score against the song's own median; 4-bar phrases in the loudest
    third, the phrase re-entering after a break, and single bars far above the rest are marked **high-energy** (hooks,
    drops). Longer tracks / previews fall back to a head + body slice. Audius also supplies BPM + key for most tracks.
+   **No structure** (analysis still pending, or the audio bytes can't be fetched — e.g. a CDN without CORS or a slow network;
+   the deck still plays): the track still plays whole phrases near its own target — 16 half-time bars, ± 4 by song length,
+   + 4 for sparse tracks, longer in the closing block — on the 16-beat grid nearest that target, never simply the shortest
+   one. Unknown tempo (no BPM metadata, e.g. Chinese catalogues) counts a half-time bar as ≈ 3.2 s.
 4. **Sequencing** – energy arc (warm-up → build → peak → cool-down) or build-up, while minimising tempo
    jumps, clashing keys (Camelot wheel) and same-artist adjacency. Tempo outliers become spares.
 5. **Mixing** – two decks, loudness-matched, tempo-synced (±8 %, half/double aware), transitions land on
@@ -99,8 +103,7 @@ Modern trap / rap rather than boom-bap. Same generic knobs any genre can use (in
 - `recent: 2015` — older releases (where the source gives a date) lose 0.4–1.2 points;
 - `vocals: true` — beat / instrumental / "type" uploads lose points, songs with `prod.` / `feat.` gain a little.
 - `minYear: 2010` — anything dated earlier is dropped;
-- `fullOnly: true` — no 30-second previews when full tracks can be found: picking iTunes swaps in Audius for this genre
-  (previews only if no full source answers);
+- `fullOnly: true` (Hip-Hop, 华语) — no 30-second previews: picking iTunes swaps in the full-track sources for this genre;
 - `covers: true` — other artists' versions / re-uploads of the seeds' songs are welcome: `scene.js` learns the seeds' own
   song titles from the dig, searches them, and counts a free version of one as close to the scene (0.6). Altered edits
   are still skipped (DJ / remix / instrumental / sped-up / slowed / "type beat" / mashups / 伴奏 / 氛围版 …), and one version per song;
@@ -109,7 +112,10 @@ Modern trap / rap rather than boom-bap. Same generic knobs any genre can use (in
 What actually plays free (tested Nov 2026 from outside mainland China): Audius — full tracks by independent artists
 (modern trap / rage / plugg, 2020+); Kugou and NetEase — the seeds' own songs are almost all paid, but covers / re-uploads
 of them and some features play in full; QQ Music — streams only for listeners in mainland China (elsewhere it finds
-nothing and drops out); iTunes — the real seed songs, 30 s previews only (used only if nothing full is found).
+nothing and drops out); iTunes — the real seed songs, 30 s previews only (only when you pick it as Source).
+**Full tracks only**: with a full-track source no preview is ever mixed in, and if Audius is unreachable Muse says so
+instead of silently switching to previews. A 30–60 s trial clip served for a paid song (stream ≤ 65 s while the catalogue
+says > 90 s) is detected when it loads or is analysed and skipped.
 
 ## 华语 / C-Pop
 Underground / new-wave Chinese rap and trap (dug from Kugou, QQ Music and NetEase together, `alsoCn`). The genre's config is only a handful of **scene seed artists**

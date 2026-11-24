@@ -59,7 +59,7 @@ const GENRES = {
                   seeds: ['downtempo', 'trip hop', 'organic', 'chillout', 'balearic', 'dub', 'ethereal', 'ambient'] },
   // 华语: current Chinese hip-hop / trap / club music (+ some modern R&B). Popular tracks wanted (hits: anti-chart scoring
   // relaxed), dug from Chinese sources first (cn: true), modern releases only (minYear, when the source reports a date)
-  'cpop':       { label: '华语 C-Pop', zh: '地下说唱 · Trap · 新浪潮', bpm: [84, 150], hits: true, cn: true, minYear: 2016,
+  'cpop':       { label: '华语 C-Pop', zh: '地下说唱 · Trap · 新浪潮', bpm: [84, 150], hits: true, cn: true, minYear: 2016, fullOnly: true,
                   seeds: ['chinese hip hop', 'chinese trap', 'mandarin rap', 'chinese drill', 'c-rap', 'chinese underground rap', '华语说唱'],
                   // scene seed artists (scene.js ranks everything else by closeness to these: collabs, producers, albums, shared results);
                   // "A|B" = same artist, B is the name the CN catalogues use
@@ -217,7 +217,13 @@ function parsePrompt(text) {
   return { g: [...g], m: [...m], words: words.slice(0, 4).map(w => w.toLowerCase()) };
 }
 
+/* full-track sources never hand back 30 s previews (a preview-only catalogue plays only when you pick it as Source) */
 async function digCrates(args) {
+  const r = await digCrates0(args), p = Providers.resolve(args.source);
+  if (!args._mix && r && r.tracks && p && p.capabilities.fullTrack) r.tracks = r.tracks.filter(t => !t.preview);
+  return r;
+}
+async function digCrates0(args) {
   let { genres, moods, prompt, need, source, onStatus, taste } = args;
   const P = parsePrompt(prompt);
   const prov = Providers.resolve(source);
@@ -448,10 +454,15 @@ const decode = buf => new OfflineAudioContext(1, 22050, 22050).decodeAudioData(b
 /* full tracks up to FULL_MAX s are decoded whole once: tempo / phase from the head as before, plus a 0.1 s energy profile of the
  * whole song (loudness, low end, onset flux) that the mix-out planner reads to find hooks / drops and hold through them */
 const FULL_MAX = 480;
+/* a short clip where the catalogue promised a full song (metadata > 90 s, clip ≤ 65 s and under 60 % of it) */
+const isTrial = (tr, sec) => isFinite(sec) && sec > 1 && sec <= 65 && (tr.dur || 0) > 90 && sec < 0.6 * tr.dur;
 async function analyzeTrack(tr) {
   if (!tr.preview && (tr.dur || 0) > 90 && (tr.dur || 0) <= FULL_MAX) {
-    try { return await analyzeFull(await decode(await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 45000)), tr.bpm); }
+    let ab = null;
+    try { ab = await decode(await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 45000)); }
     catch (e) { console.info('full analysis fell back:', tr.title, e.message); }
+    if (ab && isTrial(tr, ab.duration)) { tr.trial = true; tr.bad = true; throw new Error('trial clip (' + Math.round(ab.duration) + ' s)'); }
+    if (ab) try { return await analyzeFull(ab, tr.bpm); } catch (e) { console.info('full analysis fell back:', tr.title, e.message); }
   }
   if (!Providers.caps(tr).rangeRequests) { const a = analyzeBuffer(await decode(await fetchBytes(tr)), tr.bpm); return a; }
   const head = analyzeBuffer(await decode(await fetchBytes(tr, 'bytes=0-' + BYTES_HEAD)), tr.bpm);
@@ -977,7 +988,10 @@ class Deck {
       const fin = (ok, err) => { if (done) return; done = true; if (this._abort === abort) this._abort = null; clearTimeout(to); el.removeEventListener('canplay', onCan); el.removeEventListener('error', onErr); el.removeEventListener('loadedmetadata', onMeta); ok ? resolve() : reject(err); };
       const abort = () => fin(true); this._abort = abort;
       // this.startAt (not the argument): the planner may re-cue the deck while it is still loading
-      const onMeta = () => { if (isFinite(el.duration) && el.duration > 1) track.dur = el.duration; const sa = this.startAt; if (sa > 0 && sa < track.dur - 5) el.currentTime = sa; };
+      const onMeta = () => {
+        // a 30–60 s trial clip behind a full song's metadata (paid songs on Chinese catalogues): not a playable full track
+        if (!track.preview && isTrial(track, el.duration)) { track.trial = true; el.removeAttribute('src'); return fin(false, new Error('trial clip (' + Math.round(el.duration) + ' s)')); }
+        if (isFinite(el.duration) && el.duration > 1) track.dur = el.duration; const sa = this.startAt; if (sa > 0 && sa < track.dur - 5) el.currentTime = sa; };
       const onCan = () => { const sa = this.startAt; if (sa > 0 && Math.abs(el.currentTime - sa) > 1 && sa < track.dur - 5) { el.currentTime = sa; return; } this.ready = true; fin(true); };
       const onErr = () => fin(false, new Error('media error ' + (el.error && el.error.code)));
       const to = setTimeout(() => fin(false, new Error('load timeout')), 20000);
@@ -1155,6 +1169,13 @@ function targetHb(tr, x, rest) {
   if (rest === 1) T = Math.max(T, 28);                            // second-to-last track of a fixed-length set
   if ((tr.energy ?? 0.5) < 0.35) T += 4;                           // sparse / R&B-leaning tracks get more room
   return T;
+}
+/* no structure (analysis pending / partial / failed): still whole phrases near the target, varied by what we know about the
+ * song (length, energy, set position) — never the shortest grid point for every track */
+function fallbackHb(tr, x, rest) {
+  let T = targetHb(tr, x, rest); const d = tr.dur || 0;
+  if (d >= 270) T += 4; else if (d && d < 165) T -= 4;               // long songs breathe longer, short ones get to the point
+  return clamp(Math.round(T / 4) * 4, 12, x >= 0.8 ? 40 : 24);
 }
 /* A's out point P (track seconds, a downbeat): phrase-snapped length near the target, on a phrase end / vocal end, never
  * inside a highlight; prefers the end of a highlight and a break right before P (a drop-swap). */
@@ -1406,17 +1427,17 @@ const beatOk = t => !!(t && t.bpm && t.an && !t.preview && (t.an.bpmSrc === 'bot
 /* mix-out point: the best phrase boundary in [lo, hi] whose overlap window [P, P + w] holds no high-energy bar. Prefers a
  * boundary right after a hook / drop ends (the highlight completed), then a calmer window, then earlier. Past hi it takes the
  * first clean boundary up to cap; with no clean one it plays out to cap (the song's end). */
-function planMixOut(d, lo, hi, cap, w) {
+function planMixOut(d, lo, hi, cap, w, want = null) {
   const tr = d.track, M = barMap(tr), bs = 60 / (tr.bpm || 120), ph = d.phase, now = d.el.currentTime + 1;
   lo = Math.max(lo, now); hi = Math.max(lo, Math.min(hi, cap)); cap = Math.max(lo, cap);
   const grid = (a, b, step) => { const out = []; for (let k = Math.ceil((a - ph) / (step * bs) - 1e-6); ph + k * step * bs <= b + 1e-6; k++) out.push(ph + k * step * bs); return out; };
-  if (!M) { const c = grid(lo, hi, 16); return { P: c.length ? c[0] : lo, reason: 'no-map', map: false }; }
+  if (!M) { const c = grid(lo, hi, 16), wt = want ?? lo; return { P: c.length ? c.reduce((a, p) => Math.abs(p - wt) < Math.abs(a - wt) ? p : a) : lo, reason: 'no-map', map: false }; }
   const win = P => { const a = M.at(P + 0.05), b = M.at(P + w - 0.05); let bad = false, sum = 0, n = 0; for (let k = a; k <= b; k++) { if (k >= 0 && k < M.nb) { bad = bad || M.hi[k]; sum += M.sc[k]; n++; } } return { bad, mean: n ? sum / n : 0 }; };
   const after = P => { const k = M.at(P - 0.05); return k >= 0 && k < M.nb && M.hi[k]; };
   let best = null;
   for (const P of grid(lo, hi, 16)) {
     const W = win(P); if (W.bad) continue;
-    const sc = (after(P) ? 1 : 0) + 0.5 * clamp(-W.mean, -1, 1.5) - 0.35 * (P - lo) / (hi - lo + 1);
+    const sc = (after(P) ? 1 : 0) + 0.5 * clamp(-W.mean, -1, 1.5) - (want != null ? 0.8 * Math.abs(P - want) / (hi - lo + 1) : 0.35 * (P - lo) / (hi - lo + 1));
     if (!best || sc > best.sc) best = { P, sc, reason: after(P) ? 'after-highlight' : W.mean < -0.5 ? 'low-energy' : 'phrase' };
   }
   if (best) return { P: best.P, reason: best.reason, map: true };
@@ -1443,8 +1464,10 @@ function computeTransAt() {
       if (M) { const lo = Math.max(start + 8, cap - 32 * bs); for (let k = M.at(lo) + 1; M.t(k) <= cap; k++) if (!(M.hi[k - 1] && M.hi[k])) { out = { P: M.t(k), reason: 'outro', map: true }; } }
     } else if (st) out = planOut(tr, start, x, { now: d.el.currentTime + 1, rest, lead: 4 * bs + 1 });
     if (!out) {   // no structure (analysis pending / failed): the plain 16-beat grid near the typical length, around hooks
-      w = 8 * bs; const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1), lo = Math.min(start + 14 * hb, cap), hi = Math.min(start + 22 * hb, cap);
-      out = planMixOut(d, lo, hi, cap, w); out.L = (out.P - start) / hb;
+      // half-time bar: from the tempo when known; unknown tempo (no BPM metadata, e.g. Chinese catalogues) ≈ a 75–95 BPM bar
+      w = 8 * bs; const hb = tr.bpm ? 4 * bs * (tr.bpm > 110 ? 2 : 1) : 3.2, T = fallbackHb(tr, x, rest);
+      const lo = Math.min(start + (T - 4) * hb, cap), hi = Math.min(start + (T + 4) * hb, cap);
+      out = planMixOut(d, lo, hi, cap, w, Math.min(start + T * hb, cap)); out.L = (out.P - start) / hb; out.target = T;
     }
     const info = { x: arcX(S.idx + 1), reset: nx && nx._slot === 'reset', lastChange: !endless && nextIdx(ni + 1) < 0 };
     let pair = nx ? decideMix(tr, rate, out.P, nx, info) : null, src = 'rules', llm = null;
@@ -1469,9 +1492,14 @@ function computeTransAt() {
   const cap = dur - w - 0.6;
   let lo, hi;
   if (fullSongs()) { lo = cap - 32 * bs; hi = cap; }                                         // Full: play to the outro
-  else { const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1); lo = start + 16 * hb - w; hi = lo + 64 * bs; }   // club: phrase-based (16 half-time bars), may hold 16 bars for a drop
+  let want = null;
+  if (!fullSongs()) {   // club: phrase-based (≈ 16 half-time bars, per song: length, energy, set position), may hold 16 bars for a drop
+    const hb = 4 * bs * (tr.bpm > 110 ? 2 : 1), T = fallbackHb(tr, arcX(S.idx), opt('endless').checked ? 99 : S.set.slice(S.idx + 1).filter(t => !t.bad).length);
+    const Tc = Math.max(16, T), floor = start + 12 * hb;   // club keeps its 16-bar floor; a long mashup never starts before 12 half-time bars
+    lo = Math.max(floor, start + 16 * hb - w); want = Math.max(floor, start + Tc * hb - w); hi = Math.max(want, start + Tc * hb - w + 64 * bs);
+  }
   lo = Math.min(lo, cap);
-  const m = planMixOut(d, lo, hi, cap, w);
+  const m = planMixOut(d, lo, hi, cap, w, fullSongs() ? null : Math.min(want, cap));
   S.mixPlan = { id: tr.id, ...m, lo, hi, cap, w, short, holds: 0 };
   S.transAt = Math.max(start + 8, m.P - 0.5 * rate);   // tick fires just before P; transition() starts on the bar at P
 }
@@ -2197,6 +2225,7 @@ async function build() {
     try { res = await digCrates({ ...params, need, onStatus: s => setStatus(s, 'busy') }); if (!res.tracks.length) throw new Error('no tracks'); }
     catch (e) {
       const fb = Providers.fallbackFor(params.source); if (!fb) throw e;
+      if (caps.fullTrack && !fb.capabilities.fullTrack) throw new Error(`${prov.name} unavailable right now — Muse plays full tracks only here; pick “${fb.label || fb.name}” under Source to play 30 s previews`);
       const fbName = fb.name + (fb.capabilities.fullTrack ? '' : ' previews');
       console.warn(`${prov.name} failed, falling back to ${fbName}`, e); setStatus(`${prov.name} unavailable — using ${fbName}`, 'busy');
       params.source = fb.id; res = await digCrates({ ...params, need, onStatus: s => setStatus(s, 'busy') });
