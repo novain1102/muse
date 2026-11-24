@@ -35,13 +35,22 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    autocorrelation), loudness from the body, and a 0.1 s energy profile of the whole song (level, <150 Hz low end, onset
    flux). Per bar on the beat grid that gives a robust score against the song's own median; 4-bar phrases in the loudest
    third, the phrase re-entering after a break, and single bars far above the rest are marked **high-energy** (hooks,
-   drops). Longer tracks / previews fall back to a head + body slice. Audius also supplies BPM + key for most tracks.
+   drops). Longer tracks / previews fall back to a head + body slice. Audius also supplies BPM + key for most tracks; tracks
+   without a key (most 华语) get one estimated from the audio (chroma vs. Krumhansl–Kessler profiles, also from the head slice;
+   agrees with metadata keys within one Camelot step ~70 % of the time, so it counts a little less when ordering).
+   The whole file is read as 1 MB Range slices (3 in flight, each retried once, paused while a playing deck has < 25 s buffered so playback always comes first); a plain whole-file read is the fallback and aborts only when no bytes arrive for 15 s (a slow but moving download is allowed up to 150 s), and the
+   mix log records per track whether analysis was full, head-only, or why it failed (`S.mixLog[i].an`).
    **No structure** (analysis still pending, or the audio bytes can't be fetched — e.g. a CDN without CORS or a slow network;
    the deck still plays): the track still plays whole phrases near its own target — 16 half-time bars, ± 4 by song length,
    + 4 for sparse tracks, longer in the closing block — on the 16-beat grid nearest that target, never simply the shortest
-   one. Unknown tempo (no BPM metadata, e.g. Chinese catalogues) counts a half-time bar as ≈ 3.2 s.
-4. **Sequencing** – energy arc (warm-up → build → peak → cool-down) or build-up, while minimising tempo
-   jumps, clashing keys (Camelot wheel) and same-artist adjacency. Tempo outliers become spares.
+   one. Unknown tempo (no BPM metadata, e.g. Chinese catalogues) counts a half-time bar as ≈ 3.2 s. Without structure Muse
+   cannot know where the vocal ends, so it never chops: the exit is a 2-bar filter fade with a bass swap and an echo tail.
+4. **Sequencing** – each neighbour pair is scored on established DJ practice (rules and sources in
+   [dj_practice notes](#where-the-rules-come-from)): tempo within ±6–8 % (half / double folded; 3:2 only at a block boundary),
+   Camelot compatibility (same / ±1 / relative; +2 is a deliberate boost), energy level within ±1 of the previous track (a
+   bigger drop only for the reset), similar bass weight / density / hi-hats / vocal presence / level, language switches. The
+   warm-up → peak → cool-down arc is a soft shape on top, not a slot that forces poor neighbours. Order = best of a
+   greedy-with-lookahead build, a width-8 beam search and two other starts, each refined by local search. Tempo outliers become spares.
 5. **Mixing** – two decks, loudness-matched, tempo-synced (±8 %, half/double aware), transitions land on
    bars/phrases. Auto FX picks a scripted transition per pair: EQ bass swap, filter sweep, phaser blend,
    flange out, reverb wash, echo out, loop-roll drop with riser + impact, stutter cut, tape stop.
@@ -57,15 +66,28 @@ If a source finds nothing playable, the set comes from Audius instead. No logins
    (about 40–80 s, typically ~16 / ~50 s), up to ~40 in the closing block — and leaves on a phrase boundary, preferring
    the end of a vocal line or a break and never cutting through a hook / drop. The next track comes in on a downbeat about
    one bar before its first vocal (or at its drop / drumless intro), not from 0 s. A deterministic decision table picks
-   the move from the two tracks' features: **phrase cut** (default), **drop swap** (A breaks, B lands on the 1),
+   the move from the two tracks' features: **phrase cut** (default — a dry cut only exactly where A's phrase AND vocal line
+   end; otherwise the same cut gets an **echo throw** on A's last beat, and with no structure a 2-bar filter fade + bass swap
+   + echo tail; a live 300–3400 Hz analyser checks A right before a dry cut and, if the vocal / melody is still up, holds to
+   the next phrase end or turns the cut into an echo throw), **drop swap** (A breaks, B lands on the 1),
    **bass swap** (one bar of B's tops, lows swapped on the 1 — never two 808s or two vocals stacked), **long blend** (only
    key-compatible, both sides instrumental, ≤ ~12 % of mixes), **brake** / **tempo mask** for 1.6–5 % tempo steps,
    **ratio cut** for 3:2 / 2:1, **drumless reset** into a beatless intro, **echo out** otherwise. Within a block the
    tempo is locked (±4 % max stretch); bigger changes only happen at block boundaries, masked. No FX for their own sake:
    no mid-song stutter / loop roll in these sets, and hip-hop / R&B get more space. House / techno keep the long blends.
-   **Order** (P1): tempo ladder (neighbours ≤ 1.6 % or 3:2), the same artist at most once in any 5 tracks, at most 2–3
+   **Order** (P1): neighbour scoring as in step 4 (tempo, key, energy ±1, style), the same artist at most once in any 5 tracks, at most 2–3
    Chinese-language tracks in a row in mixed sets, a drumless-intro reset around 40–50 % of the set and the biggest gear
    shift around 66–80 %. *Per track*: **Phrases** (default) or **Full** songs.
+
+## Where the rules come from
+Mix points on phrase ends and never out during a hook (Digital DJ Tips; Mixgraph hip-hop guide); let the outgoing vocal
+finish its line, one lead vocal at a time (Mixgraph / MixReady vocal guides); cut on the 1, echo out and spinback as the
+hip-hop toolkit, quick cuts paired with an echo / spinback rather than a bare chop (Vibes DJ, London Sound Academy, DJ
+TechTools forum); one bassline at a time via a bass swap (Vibes DJ, London Sound Academy); Camelot harmonic mixing, +2 boosts
+used sparingly, neighbours within ±1 energy level (Mixed In Key); automix points taken from analysed phrases / intro-outro
+sections (Pioneer DJ rekordbox, Algoriddim djay — Serato DJ itself only has Autoplay, no automix); neighbours close in tempo /
+key / timbre (Bittner et al., ISMIR 2017, Spotify); same-style tempo range ±6–8 %, 3:2 not beat-matchable (DJ Tutor, ZOOT).
+The full rule list with links is kept with the test notes.
 
 ## ♥ Likes & taste (红心 → 按你的品味挖歌)
 - Tap **♡** on the now-playing card (or press **L**) or on any row in the tracklist to like a track; tap again to un-like.

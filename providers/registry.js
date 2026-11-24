@@ -97,8 +97,9 @@
     return new Promise((resolve, reject) => {
       const name = '__muse_jp' + Date.now().toString(36) + (jsonpSeq++);
       const s = document.createElement('script');
-      const done = (err, data) => { clearTimeout(to); try { delete window[name]; } catch (e) { window[name] = undefined; } s.remove(); err ? reject(err) : resolve(data); };
-      const to = setTimeout(() => { window[name] = () => { }; done(new Error('JSONP timeout')); }, timeout);
+      // a timed-out callback stays a no-op (a late script would otherwise throw "… is not defined")
+      let fin = false; const done = (err, data, keep) => { if (fin) return; fin = true; clearTimeout(to); if (keep) window[name] = () => { }; else try { delete window[name]; } catch (e) { window[name] = undefined; } s.remove(); err ? reject(err) : resolve(data); };
+      const to = setTimeout(() => done(new Error('JSONP timeout'), null, true), timeout);
       window[name] = data => done(null, data);
       s.onerror = () => done(new Error('JSONP load failed'));
       s.src = url + (url.includes('?') ? '&' : '?') + param + '=' + name + extra;

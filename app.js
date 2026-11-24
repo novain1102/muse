@@ -437,18 +437,56 @@ async function digSimple(prov, genres, moods, words, need, onStatus, tx = null, 
 /* ---------- in-browser analysis: tempo, beat phase, energy, loudness ---------- */
 const BYTES_HEAD = 800000;   // ~20s at 320kbps from the start: tempo + beat phase
 const BYTES_BODY = 480000;   // a slice from the body: loudness + energy (intros are often quiet)
-async function fetchOnce(url, range, timeout) {
-  const ac = new AbortController(); const to = setTimeout(() => ac.abort(), timeout);
-  try { const r = await fetch(url, { headers: range ? { Range: range } : {}, signal: ac.signal }); if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; } return await r.arrayBuffer(); }
-  finally { clearTimeout(to); }
+/* timeout = total cap; stall = abort only when no bytes arrive for that long (slow links still finish a whole song) */
+async function fetchOnce(url, range, timeout, stall = 0) {
+  const ac = new AbortController(); let why = 'timeout ' + Math.round(timeout / 1000) + ' s';
+  const to = setTimeout(() => ac.abort(), timeout); let st = null; const kick = () => { if (!stall) return; clearTimeout(st); st = setTimeout(() => { why = 'stalled ' + Math.round(stall / 1000) + ' s'; ac.abort(); }, stall); };
+  try {
+    kick(); const r = await fetch(url, { headers: range ? { Range: range } : {}, signal: ac.signal }); if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    if (!stall || !r.body || !r.body.getReader) { const b = await r.arrayBuffer(); b._st = r.status; return b; }
+    const rd = r.body.getReader(), parts = []; let n = 0;
+    for (; ;) { kick(); const { done, value } = await rd.read(); if (done) break; parts.push(value); n += value.length; }
+    const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } out.buffer._st = r.status; return out.buffer;
+  } catch (e) { if (e && e.name === 'AbortError') throw new Error(why); if (e instanceof TypeError) throw new Error('network/CORS: ' + e.message); throw e; }
+  finally { clearTimeout(to); clearTimeout(st); }
 }
 /* analysis reads try the track's alternate URL first (e.g. a content node, spreading load off a rate-limited API), then the primary, with one backoff retry */
-async function fetchBytes(tr, range, timeout = 20000) {
+async function fetchBytes(tr, range, timeout = 20000, stall = 0) {
   if (Providers.needsResolve(tr)) await Providers.prepare(tr);
   const urls = [tr.alt, tr.url].filter(Boolean); let last;
-  for (const u of urls) { try { return await fetchOnce(u, range, timeout); } catch (e) { last = e; } }
+  for (const u of urls) { try { return await fetchOnce(u, range, timeout, stall); } catch (e) { last = e; } }
   await sleep(1500 + Math.random() * 1500);
-  try { return await fetchOnce(tr.url, range, timeout); } catch (e) { throw last || e; }
+  try { return await fetchOnce(tr.url, range, timeout, stall); } catch (e) { throw last || e; }
+}
+/* whole file as 1 MB Range slices, 3 in flight, each retried once: on a slow / lossy long-haul path (e.g. mainland China ->
+ * overseas or throttled CDNs) one long download stalls or times out, while short slices keep moving and a failed slice is
+ * re-asked on its own. A server that ignores Range answers 200 with the whole file, which is used as is. */
+const RCH = 1 << 20;
+/* playback first: on a slow link the analysis download waits while a loaded deck has under 25 s buffered ahead (max 60 s) */
+function playHeadroom() {
+  let m = Infinity;
+  for (const d of S.decks || []) { const el = d.el; if (!el || !d.track || !el.src || el.ended) continue; const t = el.currentTime, b = el.buffered, dur = el.duration || Infinity; let end = t;
+    for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) > end) end = b.end(i);
+    if (end < dur - 1) m = Math.min(m, end - t); }
+  return m;
+}
+async function yieldToPlayback() { for (let i = 0; i < 60 && S.playing && playHeadroom() < 25; i++) await sleep(1000); }
+async function fetchRangedOnce(u) {
+  const get = async k => { for (let a = 0; ; a++) { await yieldToPlayback(); try { return await fetchOnce(u, `bytes=${k * RCH}-${(k + 1) * RCH - 1}`, 45000, 12000); } catch (e) { if (e.status === 416) return new ArrayBuffer(0); if (a) throw e; await sleep(600 + Math.random() * 600); } } };
+  const first = await get(0); if (first._st === 200) return first;
+  const parts = [first]; let done = first.byteLength < RCH;
+  for (let k = 1; !done; k += 3) {
+    if (k > 40) throw new Error('file over 40 MB');
+    const got = await Promise.all([k, k + 1, k + 2].map(get));
+    for (const g of got) { if (done) break; if (g._st === 200) throw new Error('range ignored mid-file'); parts.push(g); if (g.byteLength < RCH) done = true; }
+  }
+  const n = parts.reduce((x, p) => x + p.byteLength, 0), out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(new Uint8Array(p), o); o += p.byteLength; } return out.buffer;
+}
+async function fetchRanged(tr) {
+  if (Providers.needsResolve(tr)) await Providers.prepare(tr);
+  const urls = [tr.alt, tr.url].filter(Boolean); let last;
+  for (const u of urls) { try { return await fetchRangedOnce(u); } catch (e) { last = e; } }
+  throw last || new Error('no url');
 }
 const decode = buf => new OfflineAudioContext(1, 22050, 22050).decodeAudioData(buf);
 /* full tracks up to FULL_MAX s are decoded whole once: tempo / phase from the head as before, plus a 0.1 s energy profile of the
@@ -458,14 +496,21 @@ const FULL_MAX = 480;
 const isTrial = (tr, sec) => isFinite(sec) && sec > 1 && sec <= 65 && (tr.dur || 0) > 90 && sec < 0.6 * tr.dur;
 async function analyzeTrack(tr) {
   if (!tr.preview && (tr.dur || 0) > 90 && (tr.dur || 0) <= FULL_MAX) {
-    let ab = null;
-    try { ab = await decode(await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 45000)); }
-    catch (e) { console.info('full analysis fell back:', tr.title, e.message); }
+    let ab = null, buf = null; const t0 = performance.now(); tr.anLog = { mode: 'pending' };
+    let via = 'whole', rerr = null;
+    if (Providers.caps(tr).rangeRequests) { try { buf = await fetchRanged(tr); via = 'ranged'; } catch (e) { rerr = String(e.message || e).slice(0, 60); } }
+    // whole-file read (stall-based timeout) when ranges are unsupported, or failed for a reason other than a slow link
+    if (!buf && !(rerr && /stalled|timeout/.test(rerr))) try { buf = await fetchBytes(tr, Providers.caps(tr).rangeRequests ? 'bytes=0-' : null, 150000, 15000); via = 'whole'; }
+    catch (e) { tr.anLog = { mode: 'fetch-failed', err: (rerr ? 'ranged: ' + rerr + ' | ' : '') + String(e.message || e).slice(0, 60), ms: Math.round(performance.now() - t0) }; console.info('full analysis fell back:', tr.title, e.message); }
+    if (!buf && !tr.anLog.err) tr.anLog = { mode: 'fetch-failed', err: 'ranged: ' + rerr, ms: Math.round(performance.now() - t0) };
+    const nb = buf ? buf.byteLength : 0;   // decodeAudioData detaches the buffer
+    if (buf) try { ab = await decode(buf); } catch (e) { tr.anLog = { mode: 'decode-failed', err: String(e.message || e).slice(0, 80), bytes: nb, ms: Math.round(performance.now() - t0) }; }
     if (ab && isTrial(tr, ab.duration)) { tr.trial = true; tr.bad = true; throw new Error('trial clip (' + Math.round(ab.duration) + ' s)'); }
-    if (ab) try { return await analyzeFull(ab, tr.bpm); } catch (e) { console.info('full analysis fell back:', tr.title, e.message); }
+    if (ab) try { const a = await analyzeFull(ab, tr.bpm); tr.anLog = { mode: a.st ? 'full' : 'full-nostruct', via, bytes: nb, ms: Math.round(performance.now() - t0) }; return a; }
+    catch (e) { tr.anLog = { mode: 'analysis-failed', err: String(e.message || e).slice(0, 80), ms: Math.round(performance.now() - t0) }; console.info('full analysis fell back:', tr.title, e.message); }
   }
-  if (!Providers.caps(tr).rangeRequests) { const a = analyzeBuffer(await decode(await fetchBytes(tr)), tr.bpm); return a; }
-  const head = analyzeBuffer(await decode(await fetchBytes(tr, 'bytes=0-' + BYTES_HEAD)), tr.bpm);
+  if (!Providers.caps(tr).rangeRequests) { const ab = await decode(await fetchBytes(tr)), a = analyzeBuffer(ab, tr.bpm); try { a.key = estimateKey(ab); } catch (e) { } return a; }
+  const hab = await decode(await fetchBytes(tr, 'bytes=0-' + BYTES_HEAD)), head = analyzeBuffer(hab, tr.bpm); try { head.key = estimateKey(hab); } catch (e) { }
   if (tr.dur > 90) {
     try {   // offset assumes >=128kbps: lands ~50% in at 128k, ~20% in at 320k — past most intros
       const off = Math.floor(tr.dur * 0.5 * 16000);
@@ -489,13 +534,13 @@ function sliceBuf(ab, t0, t1) {
  *  - drums per bar (percussive energy + kick / hat onsets): drumless intro, breaks; hi-hat onsets per beat
  * Generic signal heuristics only (no genre lists); every result carries a confidence and callers fall back to the plain grid. */
 const ST = { N: 1024, hop: 512 };
-let _fftT = null;
+const _fftT = new Map();
 function fftTables(N) {
-  if (_fftT && _fftT.N === N) return _fftT;
+  if (_fftT.has(N)) return _fftT.get(N);
   const rev = new Uint32Array(N), bits = Math.log2(N), cos = new Float64Array(N / 2), sin = new Float64Array(N / 2);
   for (let i = 0; i < N; i++) { let r = 0; for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b); rev[i] = r; }
   for (let i = 0; i < N / 2; i++) { cos[i] = Math.cos(-2 * Math.PI * i / N); sin[i] = Math.sin(-2 * Math.PI * i / N); }
-  return (_fftT = { N, rev, cos, sin });
+  const T = { N, rev, cos, sin }; _fftT.set(N, T); return T;
 }
 function fft(re, im) {
   const N = re.length, T = fftTables(N);
@@ -507,6 +552,28 @@ function fft(re, im) {
       re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
     }
   }
+}
+/* key from audio (tracks with no key metadata, e.g. most 华语): chroma from 8192-pt FFTs over up to 64 frames (110 Hz – 2 kHz),
+ * correlated with the Krumhansl–Kessler major / minor profiles; conf = margin of the best key over the runner-up (Mixed In Key-style
+ * Camelot then drives harmonic ordering, dj_practice.md D1) */
+const KK_MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88], KK_MIN = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+const PCN = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+function estimateKey(ab) {
+  const sr = ab.sampleRate, L = ab.getChannelData(0), R = ab.numberOfChannels > 1 ? ab.getChannelData(1) : L, N = 8192;
+  const a0 = Math.floor(ab.length * 0.08), a1 = ab.length - N; if (a1 - a0 < N * 4) return null;
+  const F = Math.min(64, Math.floor((a1 - a0) / N)), chroma = new Float64Array(12), bw = sr / N, lo = Math.ceil(110 / bw), hi = Math.floor(2000 / bw);
+  const pc = new Int8Array(hi + 1); for (let k = lo; k <= hi; k++) pc[k] = ((Math.round(12 * Math.log2(k * bw / 440)) + 69) % 12 + 12) % 12;
+  const re = new Float64Array(N), im = new Float64Array(N);
+  for (let f = 0; f < F; f++) {
+    const s0 = a0 + Math.floor((a1 - a0) * f / F); for (let i = 0; i < N; i++) { re[i] = (L[s0 + i] + R[s0 + i]) * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / N)); im[i] = 0; }
+    fft(re, im); const c = new Float64Array(12); let tot = 0;
+    for (let k = lo; k <= hi; k++) { const m = Math.sqrt(re[k] * re[k] + im[k] * im[k]); c[pc[k]] += m; tot += m; }
+    if (tot > 0) for (let j = 0; j < 12; j++) chroma[j] += c[j] / tot;
+  }
+  const corr = (p, r) => { let mx = 0, my = 0; for (let j = 0; j < 12; j++) { mx += chroma[(j + r) % 12]; my += p[j]; } mx /= 12; my /= 12; let sxy = 0, sx = 0, sy = 0; for (let j = 0; j < 12; j++) { const x = chroma[(j + r) % 12] - mx, y = p[j] - my; sxy += x * y; sx += x * x; sy += y * y; } return sxy / Math.sqrt(sx * sy + 1e-12); };
+  const all = []; for (let r = 0; r < 12; r++) { all.push({ r, m: 'major', c: corr(KK_MAJ, r) }); all.push({ r, m: 'minor', c: corr(KK_MIN, r) }); }
+  all.sort((x, y) => y.c - x.c); const b = all[0];
+  return { key: PCN[b.r] + (b.m === 'minor' ? 'm' : ''), r: +b.c.toFixed(3), conf: +(b.c - all[1].c).toFixed(3) };
 }
 const pauseSlice = () => new Promise(r => setTimeout(r, 0));
 const medianOf = (buf, n) => { for (let i = 1; i < n; i++) { const v = buf[i]; let j = i - 1; while (j >= 0 && buf[j] > v) { buf[j + 1] = buf[j]; j--; } buf[j + 1] = v; } return buf[n >> 1]; };
@@ -640,14 +707,15 @@ async function structureOf(ab, an) {
 async function analyzeFull(ab, knownBpm) {
   const dur = ab.length / ab.sampleRate, head = analyzeBuffer(sliceBuf(ab, 0, 25), knownBpm);
   if (dur > 60) { const b0 = dur * 0.4, body = analyzeBuffer(sliceBuf(ab, b0, b0 + 15), head.bpm, true); head.headDb = head.db; head.db = body.db; head.dens = body.dens; head.lowRatio = body.lowRatio; head.body = true; }
-  head.prof = energyProfile(ab); head.fullDur = dur;
+  head.prof = energyProfile(ab); head.fullDur = dur; try { head.key = estimateKey(ab); } catch (e) { }
   // structure pass: the grid becomes whole-song (refined tempo) and downbeat-aligned, so bars / phrases count from a real "1"
   try { const st = await structureOf(ab, head); if (st) { head.st = st; head.bpm = st.bpm; head.phase = st.down; } }
   catch (e) { console.info('structure analysis skipped:', e.message); }
   return head;
 }
 /* store an analysis on the track; the structure pass's refined tempo replaces the head / metadata reading */
-function applyAnalysis(t, an) { t.an = an; if (!t.bpm && an.conf > 1.15) t.bpm = an.est; if (an.st) t.bpm = Math.round(an.st.bpm * 100) / 100; }
+function applyAnalysis(t, an) { t.an = an; if (!an.st) t.anLog = { ...(t.anLog || { mode: 'head-only' }), head: true }; if (!t.bpm && an.conf > 1.15) t.bpm = an.est; if (an.st) t.bpm = Math.round(an.st.bpm * 100) / 100;
+  if (!t.cam && an.key && an.key.conf >= 0.02 && an.key.r >= 0.45) { t.cam = camelot(an.key.key); t.camSrc = 'audio'; } }
 /* 0.1 s frames: e = level dB, lo = <150 Hz level dB (kick / 808), on = onset flux (rhythmic density) */
 function energyProfile(ab) {
   const sr = ab.sampleRate, L = ab.getChannelData(0), R = ab.numberOfChannels > 1 ? ab.getChannelData(1) : L, hop = Math.round(sr * 0.1), n = Math.floor(ab.length / hop), sub = 256;
@@ -763,6 +831,12 @@ function energyOf(t, norm) {
   }
   return 0.45 * (t.prior ?? 0.5) + 0.4 * bpmN + 0.15 * tier;
 }
+/* acoustic energy (what Mixed In Key's Energy Level measures: loudness, rhythmic density, tempo — no familiarity): neighbour continuity (E1) */
+function acousticOf(t, norm) {
+  if (!t.an) return null; const bpmN = t.bpm ? clamp((Math.min(t.bpm, 180) - 75) / 100, 0, 1) : 0.5, dbN = clamp((t.an.db + 24) / 16, 0, 1);
+  const g = norm && norm.useG ? grooveOf(t) : t.an.dens, lo = norm ? (norm.useG ? norm.gMin : norm.dMin) : 0, hi = norm ? (norm.useG ? norm.gMax : norm.dMax) : 1;
+  const dN = norm && g != null ? clamp((g - lo) / (hi - lo + 1e-9), 0, 1) : 0.5; return 0.3 * dbN + 0.45 * dN + 0.25 * bpmN;
+}
 function targetCurve(x, mode) {
   if (mode === 'build') return 0.12 + 0.85 * Math.pow(x, 1.15);
   return x < 0.72 ? 0.12 + 0.88 * smooth(0, 0.72, x) : 1 - 0.42 * smooth(0.72, 1, x);  // arc
@@ -772,13 +846,27 @@ function artistSet(t) {
   if (t.artistId) a.add('id:' + t.artistId); if (!a.size && t.artist) a.add(String(t.artist).toLowerCase()); return (t._as = a);
 }
 const inWin = (x, a, b) => x >= a && x <= b;
+/* ordering weights (dj_practice.md): key = Camelot compatibility (D1–D3), nbE = neighbour energy within ±1 level (E1), tim = timbre / style
+ * closeness (E3), arc = soft set shape (E2), greedy = greedy-with-lookahead start (E3). legacy = the pre-MUS-2 weighting (for A/B tests) */
+const SEQW = { key: 1.5, nbE: 1.5, tim: 2, arc: 2, greedy: true, beam: 8, legacy: false };
+const SEQW_LEGACY = { key: 0.12, nbE: 0, tim: 0, arc: 8, greedy: false, legacy: true };
+/* Camelot pair cost: same / ±1 / relative = 0, +2 energy boost = 1.2, clash = 3, unknown = 0.8 (D1, D2) */
+function camCost(a, b) { if (!a || !b) return 0.8; const k = keyDist(a, b); return k <= 0.6 ? 0 : k <= 1.5 ? 1.2 : 3; }
+/* style vector for E3: bass share, onset density, hi-hats per beat, vocal presence, level — each scaled to the pool's range */
+function styleNorm(all) {
+  const F = { lo: t => t.an && t.an.lowRatio, de: t => t.an && t.an.dens, ha: t => grooveOf(t), vo: t => { const st = stOf(t); return st ? (st.firstVocal != null ? st.vocConf : 0) : null; }, db: t => t.an && t.an.db };
+  const R = {}; for (const k in F) { const v = all.map(F[k]).filter(x => x != null && isFinite(x)); if (v.length >= 3) { const a = Math.min(...v), b = Math.max(...v); if (b - a > 1e-9) R[k] = [a, b]; } }
+  all.forEach(t => { const v = {}; let n = 0; for (const k in R) { const x = F[k](t); if (x != null && isFinite(x)) { v[k] = (x - R[k][0]) / (R[k][1] - R[k][0]); n++; } } t._sty = n ? v : null; });
+}
+function styleDist(a, b) { if (!a._sty || !b._sty) return 0.35; let s = 0, n = 0; for (const k in a._sty) if (k in b._sty) { s += Math.abs(a._sty[k] - b._sty[k]); n++; } return n ? s / n : 0.35; }
 /* fixedHead: tracks that stay at the front (playing / cued); absStart: set index of fixedHead[0] (arc positions are time-based) */
 function sequence(tracks, mode, fixedHead = [], absStart = 0) {
   const list = tracks.slice(); if (!list.length) return fixedHead.slice();
   const all = list.concat(fixedHead); markTiers(all);
   const an = all.filter(t => t.an), withG = an.filter(t => grooveOf(t) != null), useG = withG.length >= Math.max(3, an.length * 0.6);
   const norm = an.length > 2 ? { useG, gMin: useG ? Math.min(...withG.map(grooveOf)) : 0, gMax: useG ? Math.max(...withG.map(grooveOf)) : 1, dMin: Math.min(...an.map(t => t.an.dens)), dMax: Math.max(...an.map(t => t.an.dens)) } : null;
-  all.forEach(t => t.energy = energyOf(t, norm));
+  all.forEach(t => { t.energy = energyOf(t, norm); t.eAc = acousticOf(t, norm); }); styleNorm(all);
+  const W = (window.NEONDJ && NEONDJ.seqW) || SEQW;
   if (mode === 'found') return fixedHead.concat(avoidArtistRepeats(list, fixedHead));
   // tempo outliers (>15 % from the set's median after folding ×2 / ×½ / 3:2) go to the back as spares
   let spares = [];
@@ -798,19 +886,35 @@ function sequence(tracks, mode, fixedHead = [], absStart = 0) {
   const gs = all.map(grooveOf).filter(v => v != null), gSpan = gs.length > 1 ? Math.max(1e-6, Math.max(...gs) - Math.min(...gs)) : 1;
   const lowB = bpms.length ? bpms[Math.floor(bpms.length * 0.2)] : null;
   const prev0 = fixedHead[H - 1] || (lowB ? { bpm: lowB, cam: null } : null);
+  const acs = all.map(t => t.eAc).filter(v => v != null), aMin = acs.length ? Math.min(...acs) : 0, aSpan = acs.length ? Math.max(0.05, Math.max(...acs) - aMin) : 1;
+  const lvl = t => 1 + 9 * (t.eAc - aMin) / aSpan;   // acoustic energy level 1–10 (Mixed In Key style scale)
+  const tempoC = (prev, t, x) => {
+    // tempo: ≤ 1.6 % steps free, monotonic within a block, big jumps / 3:2 only at block boundaries (reset / shift windows)  (F1, F2)
+    let c = 0; const f = prev && prev.bpm && t.bpm ? tempoFam(prev.bpm, t.bpm) : { d: 0, kind: '?' }, ad = Math.abs(f.d), boundary = inWin(x, 0.38, 0.5) || inWin(x, 0.66, 0.82), dir = mode === 'build' ? 1 : x < 0.72 ? 1 : -1;
+    c += (boundary ? (W.legacy ? 30 : 60) : 150) * Math.max(0, ad - 0.016);   // block boundaries may jump (masked by brake / reset / echo)
+    if (!W.legacy && boundary && ad > 0.08) c += 2;   // F1: beyond ±8 % even a boundary jump needs a reason
+    if (f.kind === '3:2') c += boundary ? (W.legacy ? 0.5 : 1.5) : W.legacy ? 6 : 12;   // F2: 3:2 never beat-matches else if (ad > 0.03 && !boundary) c += 8;
+    if (f.kind === '1:1' && ad > 0.003 && Math.sign(f.d) === -dir) c += W.legacy ? 1.5 : 0.6;
+    if (inWin(x, 0.66, 0.8) && (ad > 0.04 || f.kind === '3:2')) c -= 1;                          // the set's gear shift lands here
+    return { c, f, ad };
+  };
+  const pairC = (prev, t, x, tc) => {
+    if (!prev) return 0; if (W.legacy) return 0.12 * keyDist(prev.cam, t.cam);
+    // key matters most when the two overlap; across a 3:2 / big jump the mix is a cut or echo out (D3)
+    // audio-estimated keys agree with metadata ~70 % of the time (within one Camelot step), so they count a little less
+    let c = W.key * camCost(prev.cam, t.cam) * (tc.f.kind === '3:2' || tc.ad > 0.06 ? 0.5 : 1) * (prev.camSrc === 'audio' || t.camSrc === 'audio' ? 0.6 : 1);
+    if (prev.eAc != null && t.eAc != null) { const d = lvl(t) - lvl(prev), free = d < 0 && inWin(x, 0.38, 0.5) ? 2.5 : 1.2; c += W.nbE * Math.pow(Math.max(0, Math.abs(d) - free), W.nbP || 2); }   // E1
+    c += W.tim * styleDist(prev, t);   // E3
+    if (isZh(prev) !== isZh(t)) c += 0.3;   // language switch: small cost (mixed sets still spread 华语 below)
+    return c;
+  };
+  const arcC = (t, i) => W.arc * Math.pow((t.energy - eMin) / span - (targets[i] - 0.12) / 0.88, 2);   // E2 (soft)
   const cost = s => {
     let c = 0, prev = prev0, zhRun = 0, sinceZh = 99, sinceA = 99, zhN = 0, zhFinal = false, prevReset = false; const seen = new Map();
     fixedHead.forEach((t, i) => { artistSet(t).forEach(a => seen.set(a, i)); if (isZh(t)) { zhRun++; zhN++; sinceZh = 0; } else { zhRun = 0; sinceZh++; } sinceA = t._tier === 'A' ? 0 : sinceA + 1; });
     for (let i = 0; i < s.length; i++) {
       const t = s[i], x = xs[i], pos = H + i, st = stOf(t);
-      // tempo: ≤ 1.6 % steps free, monotonic within a block, big jumps / 3:2 only at block boundaries (reset / shift windows)
-      const f = prev && prev.bpm && t.bpm ? tempoFam(prev.bpm, t.bpm) : { d: 0, kind: '?' }, ad = Math.abs(f.d), boundary = inWin(x, 0.38, 0.5) || inWin(x, 0.66, 0.82), dir = mode === 'build' ? 1 : x < 0.72 ? 1 : -1;
-      c += (boundary ? 30 : 150) * Math.max(0, ad - 0.016);   // block boundaries may jump (masked by brake / reset / echo)
-      if (f.kind === '3:2') c += boundary ? 0.5 : 6; else if (ad > 0.03 && !boundary) c += 8;
-      if (f.kind === '1:1' && ad > 0.003 && Math.sign(f.d) === -dir) c += 1.5;
-      if (inWin(x, 0.66, 0.8) && (ad > 0.04 || f.kind === '3:2')) c -= 1;                          // the set's gear shift lands here
-      if (prev) c += 0.12 * keyDist(prev.cam, t.cam);
-      c += 8 * Math.pow((t.energy - eMin) / span - (targets[i] - 0.12) / 0.88, 2);
+      const tc = tempoC(prev, t, x); c += tc.c + pairC(prev, t, x, tc) + arcC(t, i);
       // artists: at least 4 other tracks in between, soft until 8
       let gap = 99; artistSet(t).forEach(a => { if (seen.has(a)) gap = Math.min(gap, pos - seen.get(a)); }); c += gap < 5 ? 99 : gap < 9 ? 1 : 0;
       // language: Chinese-language tracks single or in pairs (hard cap 3 in a row), spread out, one in the last block
@@ -856,7 +960,32 @@ function sequence(tracks, mode, fixedHead = [], absStart = 0) {
     const peak = Math.max(0, Math.round(rest.length * 0.75)), up = rest.filter((_, i) => i % 4 !== 3), down = rest.filter((_, i) => i % 4 === 3).reverse();
     return first.concat(up, down).slice(0, n).concat(sb.filter(t => !first.includes(t) && !up.includes(t) && !down.includes(t)));
   })();
+  // greedy with one-step lookahead from the playing track: each next pick minimises its own neighbour + arc cost plus the best follow-up (E3)
+  const greedy = () => {
+    const left = list.slice(), out = []; let prev = prev0;
+    const loc = (p, t, i) => { const tc = tempoC(p, t, xs[i]); return tc.c + pairC(p, t, xs[i], tc) + arcC(t, i); };
+    for (let i = 0; i < list.length; i++) {
+      let bt = null, bc = Infinity;
+      for (const t of left) { let c = loc(prev, t, i); if (i + 1 < list.length && left.length > 1) { let m = Infinity; for (const u of left) if (u !== t) m = Math.min(m, loc(t, u, i + 1)); c += 0.7 * m; } if (c < bc) { bc = c; bt = t; } }
+      out.push(bt); left.splice(left.indexOf(bt), 1); prev = bt;
+    }
+    return out;
+  };
+  // beam search (width 8) over neighbour + arc cost with the artist gap as a hard rule: a third start for the local search (E3, ISMIR17 §3)
+  const beam = () => {
+    const loc = (p, t, i) => { const tc = tempoC(p, t, xs[i]); return tc.c + pairC(p, t, xs[i], tc) + arcC(t, i); };
+    const head = fixedHead.slice(-4); let B = [{ s: [], c: 0, prev: prev0 }];
+    for (let i = 0; i < list.length; i++) {
+      const nx = [];
+      for (const b of B) { const recent = head.concat(b.s).slice(-4);
+        for (const t of list) { if (b.s.includes(t)) continue; const clash = recent.some(r => [...artistSet(t)].some(a => artistSet(r).has(a)));
+          nx.push({ s: b.s.concat([t]), c: b.c + loc(b.prev, t, i) + (clash ? 99 : 0), prev: t }); } }
+      nx.sort((a, b) => a.c - b.c); B = nx.slice(0, W.beam || 8);
+    }
+    return B[0].s;
+  };
   let best = search(seq); const alt = search(ladder); if (alt.cur < best.cur) best = alt;
+  if (W.greedy) { const g = search(greedy()); if (g.cur < best.cur) best = g; const bm = search(beam()); if (bm.cur < best.cur) best = bm; }
   seq = best.seq;
   // slot roles for the transition planner: the reset (drumless intro in the 38–50 % window) and the gear shift (biggest step, 66–80 %)
   list.forEach(t => { t._slot = null; }); let resetDone = false, shift = null;
@@ -958,6 +1087,8 @@ class Deck {
     this.vu = ctx.createAnalyser(); this.vu.fftSize = 256; this.vuBuf = new Float32Array(256);
 
     this.secAn = ctx.createAnalyser(); this.secAn.fftSize = 1024; this.secBuf = new Float32Array(1024); this.trim.connect(this.secAn);   // pre-FX level for section detection
+    // live vocal / melody band (300–3400 Hz, pre-FX): works whenever the deck plays (the element is CORS-clean), analysis or not
+    this.vAn = ctx.createAnalyser(); this.vAn.fftSize = 2048; this.vAn.smoothingTimeConstant = 0.3; this.vBuf = new Float32Array(1024); this.trim.connect(this.vAn); this.vHist = [];
     this.srcNode.connect(this.trim).connect(this.low).connect(this.mid).connect(this.high).connect(this.hp).connect(this.lp);
     this.lp.connect(this.loopDry).connect(this.loopSum);
     this.lp.connect(this.loopIn).connect(this.loopDelay).connect(this.loopWet).connect(this.loopSum); this.loopDelay.connect(this.loopFb).connect(this.loopDelay);
@@ -1066,6 +1197,20 @@ class Deck {
         el.playbackRate = Math.max(0.1, r0 * Math.pow(1 - x, 1.5)); requestAnimationFrame(step); };
       requestAnimationFrame(step);
     }, startIn);
+  }
+  /* vocal / melody band level (dB) now; history (t = track seconds) for the live exit guard */
+  vocBand() {
+    this.vAn.getFloatFrequencyData(this.vBuf); const hz = ctx.sampleRate / this.vAn.fftSize, a = Math.round(300 / hz), b = Math.round(3400 / hz); let p = 0;
+    for (let i = a; i <= b; i++) p += Math.pow(10, this.vBuf[i] / 10); return 10 * Math.log10(p / (b - a + 1) + 1e-12);
+  }
+  vocSample(t) { const h = this.vHist; if (h.length && t < h[h.length - 1].t) h.length = 0; if (this.el.paused) return; h.push({ t, v: this.vocBand() }); if (h.length > 4000) h.splice(0, 1000); }
+  /* is the vocal / melody band active over the last `sec` seconds compared with this track so far? (null: not enough data) */
+  vocActive(t, sec) {
+    const h = this.vHist.filter(x => x.t > t - 300); if (h.length < 60) return null;
+    const vs = h.map(x => x.v).sort((a, b) => a - b), ref = vs[Math.floor(vs.length * 0.55)], rec = h.filter(x => x.t >= t - sec);
+    if (!rec.length) return null; const m = rec.reduce((a, x) => a + x.v, 0) / rec.length, ref40 = vs[Math.floor(vs.length * 0.4)];
+    const last = h.filter(x => x.t >= t - 0.5), ml = last.length ? last.reduce((a, x) => a + x.v, 0) / last.length : m;   // conservative: any sign of the line still running
+    return { active: m >= ref40 || ml >= ref, m: +m.toFixed(1), ref: +ref.toFixed(1) };
   }
   secLevel() { this.secAn.getFloatTimeDomainData(this.secBuf); let s = 0; for (const x of this.secBuf) s += x * x; return Math.sqrt(s / this.secBuf.length); }
   vuLevel() { this.vu.getFloatTimeDomainData(this.vuBuf); let s = 0; for (const x of this.vuBuf) s += x * x; return Math.sqrt(s / this.vuBuf.length); }
@@ -1196,7 +1341,8 @@ function planOut(tr, start, x, opts = {}) {
     if (st.bpm > 110 && Math.abs(L - Math.round(L)) > 0.01) s -= 1;   // mid half-time bar
     cands.push({ P, k, L, s, through, phr, vEnd, vThru, after, brk });
   }
-  const ok = cands.filter(c => !c.through);
+  // never out through a hook or a running vocal line (dj_practice.md B1, B2, A4) when any other phrase end is in range
+  const clean = cands.filter(c => !c.through && !c.vThru), ok = clean.length ? clean : cands.filter(c => !c.through);
   if (ok.length) { const b = ok.reduce((a, c) => c.s > a.s + 1e-9 ? c : a), why = c => c.brk ? 'break' : c.after ? 'after-highlight' : c.vEnd ? 'vocal-end' : c.phr ? 'phrase' : 'bar';
     const alts = ok.slice().sort((a, c) => c.s - a.s).slice(0, 4).map(c => ({ P: c.P, L: c.L, s: c.s, reason: why(c), vThru: c.vThru, phr: c.phr }));   // menu for the optional LLM layer
     return { ...b, reason: why(b), map: true, target: T, alts }; }
@@ -1257,10 +1403,28 @@ function decideMix(A, rateA, P, Bt, info = {}) {
   }
   if (type === 'drumlessReset') { cue = cueFor(Bt, 'intro'); if (canSync && gap <= 0.04) { rateB = lockB = Math.exp(-fam.d); } }
   if (type === 'bassSwap' && !(cue.t >= 4 * Bb)) type = 'phraseCut';
-  const T = MIXT[type], lead = T.lead === 'n' ? n : T.lead, preBeats = T.pre === 'n' ? n : T.pre;
+  // exit policy (dj_practice.md C1, C2, C4, B1, B2): a dry cut only exactly where A's phrase / vocal line has ended;
+  // A still singing / no clean end -> echo throw on its last beat; no structure at all -> 2-bar filter fade + bass swap + echo tail
+  const ex = exitAt(A, P), DRY = ['phraseCut', 'dropSwap', 'ratioCut', 'bassSwap'];
+  // tape stop = punctuation (C3): once per set, only where A's phrase is clean AND no vocal line is near the end
+  if (type === 'brake' && (!ex.clean || ex.why !== 'no-vocal' || (S.brakeN || 0) >= 1)) { type = 'echoOut'; why.push('tape stop only once, on a clean instrumental phrase end (C3) -> echo out (C2)'); }
+  const exit = !DRY.includes(type) ? 'own' : ex.clean ? 'dry' : sa ? 'throw' : 'smooth';
+  const T = MIXT[type], lead = Math.max(T.lead === 'n' ? n : T.lead, exit === 'smooth' ? 8 : exit === 'throw' ? 1.5 : 0), preBeats = T.pre === 'n' ? n : T.pre;
   const preB = Math.min(cue.t, preBeats * Bb);                       // B track seconds before its cue (≥ 0)
   return { type, why: why.join('; '), cue: cue.t, cueKind: cue.kind, cueVocal: cueV.vocal ?? null, preB, rateB, lockB, lead, n, gap: +(gap * 100).toFixed(2), fam: fam.kind, sync, next: Bt.id,
-    aVocThru, aBreak, keyOk, allowed: [...allowed] };
+    aVocThru, aBreak, keyOk, allowed: [...allowed], exit, exitWhy: ex.why };
+}
+/* is A's out point P a clean end? phrase boundary + A's vocal line ended (or none in the last two beats), not inside a hook */
+function exitAt(A, P) {
+  const st = stOf(A); if (!st) return { clean: false, why: 'no-structure' };
+  const B = 60 / st.bpm, M = barMap(A), k = barIdx(st, P + 0.05), hook = !!(M && k > 0 && k < M.nb && M.hi[k - 1] && M.hi[k]);
+  const phr = onPhrase(st, P) || Math.abs((P - st.down) / st.bar - Math.round((P - st.down) / st.bar)) * st.bar < 0.04 && st.breaks.some(([a, b]) => b === k);
+  if (hook) return { clean: false, why: 'in-hook' };
+  if (st.vocConf < 0.2) return { clean: phr, why: phr ? 'phrase (vocals unknown)' : 'off-phrase' };
+  const vEnd = st.vocEnds.some(e => e >= P - st.bar - 0.3 * B && e <= P + 0.3 * B), vLast = vocalIn(st, P - 2 * B, P) ?? 1, vNext = vocalIn(st, P, P + B) ?? 1;
+  if (vLast > 0.5 && vNext > 0.5) return { clean: false, why: 'vocal-through' };
+  const clean = phr && (vEnd || vLast <= 0.25);
+  return { clean, why: clean ? (vEnd ? 'vocal-end' : 'no-vocal') : !phr ? 'off-phrase' : 'vocal-active' };
 }
 /* ---------- optional LLM layer (Advanced → LLM assist; off by default) ----------
  * Hybrid: the rules build a small candidate menu per pair (out-point from planOut's best phrase ends × the transition types
@@ -1789,7 +1953,7 @@ function mixShort(D, I, tr, to, kind) {
     if (leadOf(plan) + 0.03 > dt) { dt = D.untilBeat(4, leadOf(plan) + 0.1); P = D.el.currentTime + dt * rateA; plan = decideMix(D.track, rateA, P, tr, info); }
     Tone = now + dt;
   }
-  const SC = SCRIPTS[plan.type]; S.lastScript = plan.type; S.lastType = plan.type; S.mixN = (S.mixN || 0) + 1; if (plan.type === 'longBlend') S.longN = (S.longN || 0) + 1;
+  const SC = SCRIPTS[plan.type]; S.lastScript = plan.type; S.lastType = plan.type; S.mixN = (S.mixN || 0) + 1; if (plan.type === 'brake') S.brakeN = (S.brakeN || 0) + 1; if (plan.type === 'longBlend') S.longN = (S.longN || 0) + 1;
   I.el.playbackRate = plan.rateB; I.lockRate = plan.lockB; I.el.preservesPitch = true;
   const inAt = Tone - plan.preB / plan.rateB, want = Math.max(0, plan.cue - plan.preB);
   I.startAt = want; if (Math.abs(I.el.currentTime - want) > 0.03) I.el.currentTime = want;
@@ -1800,12 +1964,36 @@ function mixShort(D, I, tr, to, kind) {
   I.restore(now, 0.01); I.xf.gain.setValueAtTime(0, now);
   D.auto = I.auto = true;
   const r = plan.type === 'echoOut' ? SC.fn(D, I, Tone - 4 * B, B, 4) : SC.fn(D, I, Tone, B, plan);
+  applyExit(D, Tone, B, plan, r);
   showFx(SC.label + (plan.sync ? ' · SYNC' : ''), Math.max(now, T0), true, Math.max(1.5, r.end - T0), D.name + '→' + I.name);
   logMix(D, tr, plan.type, plan.sync, kind, Tone, { inAt, end: r.end, one: Tone }, plan);
   const lat = 0.035;
   setTimeout(() => { if (S.inTrans) I.el.play().then(() => { if (plan.sync) setTimeout(() => phaseNudge(D, I, 3), 300); }).catch(console.warn); }, Math.max(0, (inAt - ctx.currentTime - lat) * 1000));
   setTimeout(() => $('#xfadeBadge').classList.add('on'), Math.max(0, (T0 - now) * 1000));
   setTimeout(() => finishTransition(D, I, to), Math.max(0, (r.end - ctx.currentTime) * 1000 + 60));
+}
+/* how A leaves (dj_practice.md C1/C2/C4/C5): 'dry' = the script's cut (only at a clean phrase / vocal end);
+ * 'throw' = beat-synced echo throw on A's last beat + short high-pass, A's fader closes over half a beat, the tail rings on;
+ * 'smooth' (no structure known) = 2-bar high-pass fade, bass swap on the 1, echo tail, A gone over 2 beats */
+function applyExit(D, T, B, plan, r) {
+  const ex = plan.exit; if (!ex || ex === 'dry') return;
+  if (ex === 'own') { if (plan.type === 'tempoMask' || plan.type === 'drumlessReset' || plan.type === 'echoOut') { D._tailUntil = T + 8 * B; D._tailFb = 0.45; } return; }   // their echo rings out too
+  const fD = filterFreqs(D.knob.filter);
+  if (ex === 'throw') {
+    D.echo(T - B, 0.55, 0.45, 0.5);
+    hold(D.hp.frequency, T - B); D.hp.frequency.setValueAtTime(Math.max(10, fD.hp), T - B); expo(D.hp.frequency, 380, T);
+    if (plan.type !== 'bassSwap') { hold(D.xf.gain, T - 0.012); D.xf.gain.setValueAtTime(1, T - 0.012); curve(D.xf.gain, 1, 0, T - 0.012, T + 0.5 * B, 'eqp'); r.end = Math.max(r.end, T + 0.5 * B + 0.02); }
+    showFx('ECHO THROW', T - B, false, B, D.name);
+  } else {   // smooth
+    const T0 = T - 8 * B;
+    [D.hp.frequency, D.xf.gain, D.low.gain].forEach(p => hold(p, T0));
+    D.hp.frequency.setValueAtTime(Math.max(10, fD.hp), T0); expo(D.hp.frequency, 450, T);
+    D.xf.gain.setValueAtTime(1, T0); curve(D.xf.gain, 1, 0.75, T0, T, 'eqp'); curve(D.xf.gain, 0.75, 0, T, T + 2 * B, 'eqp');
+    D.low.gain.setValueAtTime(D.knob.low, T - 0.025); lin(D.low.gain, -32, T + 0.01);
+    D.echo(T - B, 0.6, 0.45, 0.75); r.end = Math.max(r.end, T + 2 * B + 0.02);
+    showFx('FILTER FADE · ECHO', T0, false, 8 * B, D.name);
+  }
+  D._tailUntil = T + 8 * B; D._tailFb = 0.45;
 }
 /* beat-phase correction after the incoming deck starts (like nudging a jog wheel) */
 function phaseNudge(D, I, tries = 1) {
@@ -1825,8 +2013,9 @@ function logMix(D, tr, script, synced, kind, T, r, plan = null) {
   let inHigh = false; if (M) for (let k = M.at(outT + 0.05); k <= M.at(outEnd - 0.05); k++) if (M.hi[k]) inHigh = true;
   const e = { title: o.title, artist: o.artist, dur: +dur.toFixed(1), from: +S.segStart.toFixed(1), out: +outT.toFixed(1), played: +(outT - S.segStart).toFixed(1),
     pct: dur ? +((outT - S.segStart) / dur * 100).toFixed(1) : null, script, kind, aligned: synced, beatOk: [beatOk(o), beatOk(tr)], overlap: +Math.max(0, r.end - r.inAt).toFixed(2),
-    reason: P.reason || kind, map: !!M, highs: M ? M.secs.map(([a, b]) => [+M.t(a).toFixed(1), +M.t(b).toFixed(1)]) : [], inHigh, holds: P.holds || 0, next: tr.title };
+    reason: P.reason || kind, map: !!M, an: o.anLog ? { ...o.anLog } : (o.an ? { mode: o.an.st ? 'full' : 'head-only' } : { mode: 'none' }), highs: M ? M.secs.map(([a, b]) => [+M.t(a).toFixed(1), +M.t(b).toFixed(1)]) : [], inHigh, holds: P.holds || 0, next: tr.title };
   if (plan) Object.assign(e, { hb: st ? +((outT - S.segStart) / st.hbar).toFixed(1) : null, onPhrase: st ? onPhrase(st, outT) : null, x: P.x ?? null, why: plan.why, cue: +plan.cue.toFixed(2), cueKind: plan.cueKind,
+    exit: plan.exit || null, exitWhy: plan.exitWhy || null, live: P.live || null, deferred: !!P.deferred,
     src: P.pair === plan ? (P.src || 'rules') : 'rules', llmId: P.pair === plan && P.llm ? P.llm.id : null, cueVocal: plan.cueVocal != null ? +plan.cueVocal.toFixed(2) : null, rateB: +plan.rateB.toFixed(4), lockB: +plan.lockB.toFixed(4), gap: plan.gap, fam: plan.fam, rateA: +rate.toFixed(4), vocConfB: sb ? +sb.vocConf.toFixed(2) : null });
   (S.mixLog || (S.mixLog = [])).push(e); console.info('[mix]', JSON.stringify(e));
 }
@@ -1836,6 +2025,7 @@ function finishTransition(D, I, to) {
   S.playedSec = (S.playedSec || 0) + Math.max(0, t - (S.liveSince ?? t)); S.liveSince = t;
   hold(D.xf.gain, t); D.xf.gain.setValueAtTime(0, t + 0.01);
   D.restore(t + 0.02, 0.08); I.restore(t, 0.08);
+  if (D._tailUntil > t) { hold(D.dFb.gain, t + 0.03); D.dFb.gain.setValueAtTime(D._tailFb || 0.45, t + 0.03); D.dFb.gain.setTargetAtTime(0.3 + D.knob.delay * 0.3, D._tailUntil, 0.4); D._tailUntil = 0; }   // let the echo tail ring out
   D.auto = I.auto = false; D.ready = false;
   S.live = I; S.idx = to; S.inTrans = false; S.segStart = I.el.currentTime; S.lastFlourish = -1;
   $('#xfadeBadge').classList.remove('on');
@@ -1861,12 +2051,33 @@ function onDeckError(d) {
   }
 }
 
+/* live exit guard (dj_practice.md B1, B2, A1): right before a planned DRY cut, if A's vocal / melody band is still up,
+ * defer once to the next phrase end (structure known, still clean of hooks), else turn the cut into an echo throw */
+function liveGuard(d, t) {
+  const P = S.mixPlan; if (!P || P.id !== d.track.id || !P.short || !P.pair || !(P.pair.exit === 'dry' || P.pair.type === 'brake') || P.guarded) return false;   // dry cuts and tape stops (C3: phrase end only)
+  const B = d.beatSec || 0.6, va = d.vocActive(t, 1.5 * B); P.guarded = true; P.live = va;
+  if (!va || !va.active) return false;
+  const st = stOf(d.track), M = barMap(d.track), nx = S.set[nextIdx(S.idx + 1)];
+  if (st && nx && !P.deferred) {
+    const P2 = P.P + st.phrase, k = barIdx(st, P2 + 0.05), hook = M && k > 0 && k < M.nb && M.hi[k - 1] && M.hi[k];
+    if (!hook && P2 < (d.track.dur || 0) - 8 && (P2 - S.segStart) / st.hbar <= 40) {
+      const pair = decideMix(d.track, d.el.playbackRate || 1, P2, nx, { x: arcX(S.idx + 1), reset: nx._slot === 'reset', lastChange: false });
+      const rate = d.el.playbackRate || 1, lead = Math.max(pair.lead * d.beatSec, pair.preB / pair.rateB) + 0.05;
+      S.mixPlan = { ...P, P: P2, pair, reason: (P.reason || '') + '+deferred', deferred: true, guarded: false, src: 'rules', llm: null };
+      S.transAt = Math.max(t + 0.2, P2 - (lead + 0.6) * rate); return true;
+    }
+  }
+  if (P.pair.type === 'brake') { P.pair = { ...P.pair, type: 'tempoMask', exit: 'own', exitWhy: 'live-vocal' }; return false; }   // no tape stop over a vocal (C3) -> echo throw (C2)
+  P.pair = { ...P.pair, exit: 'throw', exitWhy: 'live-vocal', lead: Math.max(P.pair.lead, 1.5) }; return false;
+}
 /* main clock: mix-out triggers, tempo glide, scripted flourishes */
 function tick() {
   const d = S.live; if (!d || !S.playing || S.paused) return;
   const t = d.el.currentTime;
+  d.vocSample(t);
   if (!S.inTrans) {
     if (t >= S.transAt || d.el.ended) {
+      if (!d.el.ended && liveGuard(d, t)) return;
       // no energy map for this track: the live section detector holds a mix that would land in a drop (max 2 phrases)
       const P = S.mixPlan, bs = 60 / ((d.track && d.track.bpm) || 120);
       if (!d.el.ended && P && P.id === d.track.id && !P.map && P.reason !== 'preview' && d.sec && d.sec.name === 'drop' && P.holds < 2 && S.transAt + 16 * bs < (P.cap || 0)) { P.holds++; S.transAt += 16 * bs; return; }
@@ -2140,7 +2351,7 @@ async function analyzeAll() {
       todo.sort((a, b) => a.i - b.i);
       await pool(todo.slice(0, 2), 2, async ({ t }) => {
         try { applyAnalysis(t, await analyzeTrack(t)); }
-        catch (e) { t.anFail = true; console.info('analysis skipped:', t.title, e.message); }
+        catch (e) { t.anFail = true; t.anLog = { ...(t.anLog || {}), mode: t.trial ? 'trial-clip' : 'failed', err2: String(e.message || e).slice(0, 80) }; console.info('analysis skipped:', t.title, e.message); }
         S.decks.forEach(d => { if (d.track === t && ctx) applyAutoGain(d); });
         if (S.live && !S.inTrans && (S.live.track === t || S.set[nextIdx(S.idx + 1)] === t)) computeTransAt();
         renderList();
@@ -2220,7 +2431,7 @@ async function build() {
   S.buildId++;
   try {
     setStatus('Finding tracks…', 'busy');
-    if (!(S.playing && S.live && !S.inTrans)) { S.playedSec = 0; S.mixN = 0; S.longN = 0; S.lastType = ''; S.mixLog = []; }
+    if (!(S.playing && S.live && !S.inTrans)) { S.playedSec = 0; S.mixN = 0; S.longN = 0; S.brakeN = 0; S.lastType = ''; S.mixLog = []; }
     let res;
     try { res = await digCrates({ ...params, need, onStatus: s => setStatus(s, 'busy') }); if (!res.tracks.length) throw new Error('no tracks'); }
     catch (e) {
@@ -2241,7 +2452,7 @@ async function build() {
       S.set = fresh; S.idx = -1; renderAll();
       // listen first: analyse the crate (bounded time) so the opener and arc are chosen from real audio features
       let done = 0; const deadline = sleep(14000);
-      const job = pool(fresh, 3, async t => { try { applyAnalysis(t, await analyzeTrack(t)); } catch (e) { t.anFail = true; }
+      const job = pool(fresh, 3, async t => { try { applyAnalysis(t, await analyzeTrack(t)); } catch (e) { t.anFail = true; t.anLog = { ...(t.anLog || {}), mode: t.trial ? 'trial-clip' : 'failed', err2: String(e.message || e).slice(0, 80) }; }
         done++; if (!S.playing) setStatus(`Analysing ${done}/${fresh.length}…`, 'busy'); });
       await Promise.race([job, deadline]);
       S.set = sequence(fresh.filter(t => !t.bad), opt('order').value, []); renderAll();
@@ -2675,7 +2886,7 @@ function init() {
     try { const r = await Providers.get('netease').search('lofi', { limit: 3 }); setStatus(r.length ? 'NetEase proxy OK — pick it under Source' : 'Proxy answered, but no results', r.length ? 'ok' : 'err'); }
     catch (e) { setStatus('Proxy not reachable: ' + (e.message || e), 'err'); }
   });
-  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, LLM, LLM_PRESETS, __targetHb: targetHb, llmCfg, llmPrefetch, llmMenu, llmPrompt, llmParse, llmChat, llmUse, planOut, decideMix, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
+  window.NEONDJ = Object.assign(window.NEONDJ || {}, { S, SEQW, SEQW_LEGACY, camCost, styleDist, tempoFam, keyDist, estimateKey, LLM, LLM_PRESETS, __targetHb: targetHb, llmCfg, llmPrefetch, llmMenu, llmPrompt, llmParse, llmChat, llmUse, planOut, decideMix, barMap, build, digCrates, sequence, analyzeTrack, applyAnalysis, transition, SCRIPTS, Master, MOVES,
     structureOf, cueFor, planOut, decideMix, tempoFam, arcX, stOf, beatOk, isZh, energyOf, markTiers, computeTransAt, onPhrase, vocalIn, keyDist });   // for debugging / tests (+ .providers)
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();
